@@ -12,6 +12,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.vbd.particle_vbd_kernels import (
+    _guard_vbd_accumulated_displacement,
     accumulate_particle_body_contact_force_and_hessian,
     evaluate_dihedral_angle_based_bending_force_hessian,
     evaluate_neo_hookean_membrane_force_hessian,
@@ -41,6 +42,7 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     update_duals_body_body_contacts,
     update_duals_joint,
 )
+from newton._src.utils.mesh import MeshAdjacency, MeshAdjacencyData
 from newton.solvers.experimental.coupled import SolverCoupledProxy
 from newton.tests.unittest_utils import (
     add_function_test,
@@ -3735,8 +3737,351 @@ def _soft_contact_presize_is_world_aware(test, device):
         test.assertEqual(sizes[4], 4 * sizes[1], f"{globals_kind=}")
 
 
+_ROUND6_TET_REST_POSITIONS = np.asarray(
+    (
+        (0.3138579588429897, 0.026760264374019033, 0.05433111889271057),
+        (0.31346202987107546, 0.028701121132041044, 0.05459566434641573),
+        (0.31412371953350043, 0.028571213493497186, 0.05325557952305392),
+        (0.31224044526860734, 0.028138933844943956, 0.05319341845993587),
+    ),
+    dtype=np.float64,
+)
+_ROUND6_TET_FAILURE_POSITIONS = np.asarray(
+    (
+        (0.3167664408683777, 0.025306465104222298, 0.004185124300420284),
+        (0.315519779920578, 0.030701162293553352, 0.004596977028995752),
+        (0.3171851933002472, 0.028201648965477943, 0.004208472091704607),
+        (0.3136656880378723, 0.027622921392321587, 0.005581264849752188),
+    ),
+    dtype=np.float64,
+)
+
+
+def _round6_tet_determinant(points):
+    """Compute one signed tetrahedron determinant for the frozen Round6 fixture."""
+    return float(np.dot(np.cross(points[1] - points[0], points[2] - points[0]), points[3] - points[0]))
+
+
+@wp.kernel
+def _round6_guard_fixture_kernel(
+    particle_ids: wp.array[wp.int32],
+    pos: wp.array[wp.vec3],
+    collision_detection_anchor: wp.array[wp.vec3],
+    proposed_displacements: wp.array[wp.vec3],
+    tet_indices: wp.array2d[wp.int32],
+    tet_poses: wp.array[wp.mat33],
+    particle_adjacency: MeshAdjacencyData,
+    guarded_displacements: wp.array[wp.vec3],
+):
+    sample = wp.tid()
+    particle = particle_ids[sample]
+    guarded_displacements[sample] = _guard_vbd_accumulated_displacement(
+        particle,
+        pos,
+        collision_detection_anchor,
+        proposed_displacements[sample],
+        tet_indices,
+        tet_poses,
+        particle_adjacency,
+    )
+
+
+def _round6_guard_fixture(
+    device,
+    pos,
+    anchor,
+    proposed,
+    tet_indices,
+    tet_poses,
+    particle_ids=(0,),
+    adjacency_tet_indices=None,
+):
+    """Run the guarded accumulated-displacement helper on a local fixture."""
+    pos = np.asarray(pos, dtype=np.float32).reshape(-1, 3)
+    anchor = np.asarray(anchor, dtype=np.float32).reshape(-1, 3)
+    proposed = np.asarray(proposed, dtype=np.float32).reshape(-1, 3)
+    tet_indices = np.asarray(tet_indices, dtype=np.int32).reshape(-1, 4)
+    tet_poses = np.asarray(tet_poses, dtype=np.float32).reshape(-1, 3, 3)
+    particle_ids = np.asarray(particle_ids, dtype=np.int32).reshape(-1)
+    if adjacency_tet_indices is None:
+        adjacency_tet_indices = tet_indices
+    adjacency_tet_indices = np.asarray(adjacency_tet_indices, dtype=np.int32).reshape(-1, 4)
+    adjacency = MeshAdjacency(tet_indices=adjacency_tet_indices)
+    adjacency.init_vertex_adjacency(pos.shape[0])
+    adjacency_device = adjacency.to(device)
+    outputs = wp.empty(particle_ids.shape[0], dtype=wp.vec3, device=device)
+    wp.launch(
+        _round6_guard_fixture_kernel,
+        dim=particle_ids.shape[0],
+        inputs=[
+            wp.array(particle_ids, dtype=wp.int32, device=device),
+            wp.array(pos, dtype=wp.vec3, device=device),
+            wp.array(anchor, dtype=wp.vec3, device=device),
+            wp.array(proposed, dtype=wp.vec3, device=device),
+            wp.array(tet_indices, dtype=wp.int32, device=device),
+            wp.array(tet_poses, dtype=wp.mat33, device=device),
+            adjacency_device,
+        ],
+        outputs=[outputs],
+        device=device,
+    )
+    return outputs.numpy()
+
+
+def _round6_tet_poses(rest, tet_indices):
+    """Build float32 inverse rest matrices for local tetrahedra."""
+    rest = np.asarray(rest, dtype=np.float64)
+    tet_indices = np.asarray(tet_indices, dtype=np.int32).reshape(-1, 4)
+    poses = []
+    for tet in tet_indices:
+        points = rest[tet]
+        dm = np.column_stack((points[1] - points[0], points[2] - points[0], points[3] - points[0]))
+        poses.append(np.linalg.inv(dm))
+    return np.asarray(poses, dtype=np.float32)
+
+
+def _test_vbd_positive_j(test, device):
+    """Guard the frozen Clawhauser tet-2891 update above its determinant floor."""
+    current = _ROUND6_TET_FAILURE_POSITIONS.copy()
+    current[0] = _ROUND6_TET_REST_POSITIONS[0]
+    anchor = _ROUND6_TET_REST_POSITIONS.copy()
+    proposed = _ROUND6_TET_FAILURE_POSITIONS[0] - anchor[0]
+    tet_indices = np.asarray([[0, 1, 2, 3]], dtype=np.int32)
+    tet_poses = _round6_tet_poses(_ROUND6_TET_REST_POSITIONS, tet_indices)
+    guarded = _round6_guard_fixture(device, current, anchor, [proposed], tet_indices, tet_poses)[0]
+    updated = current.copy()
+    updated[0] = anchor[0] + guarded
+    determinant = _round6_tet_determinant(updated)
+    rest_determinant = 5.063832243853127e-09
+    determinant_floor = min(0.1 * rest_determinant, max(1.0e-12, 1.0e-4 * rest_determinant))
+    test.assertGreater(determinant, determinant_floor)
+    test.assertLess(float(np.linalg.norm(guarded)), float(np.linalg.norm(proposed)))
+    accepted_fraction = guarded / np.asarray(proposed, dtype=np.float32)
+    test.assertTrue(np.allclose(accepted_fraction, 0.89171476, rtol=0.0, atol=2.0e-4))
+
+
+def _round6_scaled_tet(rest_determinant):
+    """Build one axis-aligned tet with the requested positive rest determinant."""
+    return np.asarray(
+        (
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.0, 0.0, rest_determinant),
+        ),
+        dtype=np.float64,
+    )
+
+
+def _round6_guarded_determinants(points, tet_indices):
+    """Compute signed float64 determinants for a local tet fixture."""
+    points = np.asarray(points, dtype=np.float64)
+    return np.asarray([_round6_tet_determinant(points[tet]) for tet in tet_indices], dtype=np.float64)
+
+
+def _test_vbd_positive_j_safe_and_empty(test, device):
+    """Preserve exact safe and no-tet accumulated displacements."""
+    rest = _round6_scaled_tet(1.0)
+    tet_indices = np.asarray([[0, 1, 2, 3]], dtype=np.int32)
+    tet_poses = _round6_tet_poses(rest, tet_indices)
+    safe_proposed = np.asarray([[0.0, 0.0, 0.01]], dtype=np.float32)
+    safe = _round6_guard_fixture(device, rest, rest, safe_proposed, tet_indices, tet_poses)[0]
+    test.assertTrue(np.array_equal(safe, safe_proposed[0]))
+
+    no_tet_indices = np.asarray([[1, 2, 3, 4]], dtype=np.int32)
+    no_tet_poses = np.zeros((1, 3, 3), dtype=np.float32)
+    no_tet_proposed = np.asarray([[0.25, -0.5, 0.75]], dtype=np.float32)
+    no_tet = _round6_guard_fixture(
+        device,
+        np.zeros((5, 3), dtype=np.float32),
+        np.zeros((5, 3), dtype=np.float32),
+        no_tet_proposed,
+        no_tet_indices,
+        no_tet_poses,
+    )[0]
+    test.assertTrue(np.array_equal(no_tet, no_tet_proposed[0]))
+
+
+def _test_vbd_positive_j_multiple_incident_tets(test, device):
+    """Select the smallest ordered incident-tet fraction and clear both floors."""
+    rest = np.asarray(
+        (
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.0, 0.0, 2.0),
+            (1.0, 0.0, 0.0),
+            (0.0, 2.0, 0.0),
+            (0.0, 0.0, 0.2),
+        ),
+        dtype=np.float64,
+    )
+    tet_indices = np.asarray(((0, 1, 2, 3), (0, 4, 5, 6)), dtype=np.int32)
+    tet_poses = _round6_tet_poses(rest, tet_indices)
+    proposed = np.asarray([[0.0, 0.0, 2.0]], dtype=np.float32)
+    guarded = _round6_guard_fixture(device, rest, rest, proposed, tet_indices, tet_poses)[0]
+    accepted_fraction = float(guarded[2] / proposed[0, 2])
+
+    current_determinants = _round6_guarded_determinants(rest, tet_indices)
+    proposed_points = rest.copy()
+    proposed_points[0] += proposed[0]
+    proposed_determinants = _round6_guarded_determinants(proposed_points, tet_indices)
+    rest_determinants = _round6_guarded_determinants(rest, tet_indices)
+    floors = np.minimum(0.1 * rest_determinants, np.maximum(1.0e-12, 1.0e-4 * rest_determinants))
+    fractions = 0.9 * (current_determinants - floors) / (current_determinants - proposed_determinants)
+    expected_fraction = float(np.min(fractions))
+    test.assertAlmostEqual(accepted_fraction, expected_fraction, delta=2.0e-4)
+
+    updated = rest.copy()
+    updated[0] += guarded
+    output_determinants = _round6_guarded_determinants(updated, tet_indices)
+    for determinant, floor in zip(output_determinants, floors, strict=True):
+        test.assertGreater(float(determinant), float(floor))
+
+
+def _test_vbd_positive_j_floor_branches(test, device):
+    """Exercise relative, absolute, and tiny-rest-cap determinant floors."""
+    cases = ((1.0, 1.0e-4), (1.0e-9, 1.0e-12), (1.0e-13, 1.0e-14))
+    for rest_determinant, expected_floor in cases:
+        rest = _round6_scaled_tet(rest_determinant)
+        tet_indices = np.asarray([[0, 1, 2, 3]], dtype=np.int32)
+        tet_poses = _round6_tet_poses(rest, tet_indices)
+        proposed = np.asarray([[0.0, 0.0, 2.0 * rest_determinant]], dtype=np.float32)
+        guarded = _round6_guard_fixture(device, rest, rest, proposed, tet_indices, tet_poses)[0]
+        accepted_fraction = float(guarded[2] / proposed[0, 2])
+        expected_fraction = 0.45 * (1.0 - expected_floor / rest_determinant)
+        test.assertAlmostEqual(accepted_fraction, expected_fraction, delta=3.0e-3)
+        updated = rest.copy().astype(np.float32)
+        updated[0] += guarded
+        determinant = _round6_tet_determinant(updated)
+        test.assertGreater(determinant, expected_floor)
+
+
+def _test_vbd_positive_j_invalid_inputs(test, device):
+    """Leave invalid current and rest determinants observable without repair."""
+    rest = _round6_scaled_tet(1.0)
+    tet_indices = np.asarray([[0, 1, 2, 3]], dtype=np.int32)
+    tet_poses = _round6_tet_poses(rest, tet_indices)
+
+    invalid_current = rest.copy()
+    invalid_current[0, 2] = 2.0
+    proposed = np.asarray([[0.0, 0.0, 0.25]], dtype=np.float32)
+    guarded = _round6_guard_fixture(device, invalid_current, rest, proposed, tet_indices, tet_poses)[0]
+    test.assertTrue(np.array_equal(guarded, (invalid_current[0] - rest[0]).astype(np.float32)))
+    test.assertLess(_round6_tet_determinant(invalid_current), 0.0)
+
+    nonfinite_current = rest.copy()
+    nonfinite_current[0, 2] = np.nan
+    guarded = _round6_guard_fixture(device, nonfinite_current, rest, proposed, tet_indices, tet_poses)[0]
+    test.assertTrue(np.isnan(guarded).any())
+
+    nonfinite_rest_pose = tet_poses.copy()
+    nonfinite_rest_pose[0, 0, 0] = np.nan
+    guarded = _round6_guard_fixture(device, rest, rest, proposed, tet_indices, nonfinite_rest_pose)[0]
+    test.assertTrue(np.array_equal(guarded, np.zeros(3, dtype=np.float32)))
+    test.assertGreater(_round6_tet_determinant(rest), 0.0)
+
+
+def _round6_solver_model(device):
+    """Build a minimal positive-rest tetrahedral VBD model for path tests."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    for position in ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)):
+        builder.add_particle(pos=wp.vec3(*position), vel=wp.vec3(0.0), mass=1.0e3)
+    builder.add_tetrahedron(0, 1, 2, 3, k_mu=1.0e3, k_lambda=1.0e3, k_damp=0.0)
+    builder.color()
+    return builder.finalize(device=device)
+
+
+def _round6_solver_step(device, tile_solve, capture=False):
+    """Run one minimal SolverVBD step and return the output particle positions."""
+    model = _round6_solver_model(device)
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=1,
+        particle_enable_tile_solve=tile_solve,
+        particle_collision_detection_interval=-1,
+    )
+    state_in = model.state()
+    state_out = model.state()
+    current = model.particle_q.numpy()
+    current[0, 2] = 0.9
+    state_in.particle_q.assign(current)
+    state_in.particle_qd.zero_()
+    control = model.control(clone_variables=False)
+    dt = 0.01
+    if capture:
+        with wp.ScopedCapture(device=device) as capture_context:
+            solver.step(state_in, state_out, control, None, dt)
+        test_graph = capture_context.graph
+        if test_graph is None:
+            raise AssertionError("SolverVBD step did not produce a CUDA graph")
+        wp.capture_launch(test_graph)
+    else:
+        solver.step(state_in, state_out, control, None, dt)
+    return state_out.particle_q.numpy().copy()
+
+
+def _test_vbd_positive_j_solver_paths(test, device):
+    """Preserve positive determinants across scalar, tile, deterministic, and captured VBD steps."""
+    tile_options = (False, True) if device.is_cuda else (False,)
+    outputs = []
+    for tile_solve in tile_options:
+        output = _round6_solver_step(device, tile_solve)
+        outputs.append(output)
+        test.assertGreater(_round6_tet_determinant(output), 0.0)
+
+    if device.is_cuda:
+        repeated = _round6_solver_step(device, False)
+        test.assertTrue(np.array_equal(outputs[0], repeated))
+        captured = _round6_solver_step(device, False, capture=True)
+        test.assertGreater(_round6_tet_determinant(captured), 0.0)
+
+
 class TestSolverVBD(unittest.TestCase):
     pass
+
+
+add_function_test(
+    TestSolverVBD,
+    "test_vbd_positive_j",
+    _test_vbd_positive_j,
+    devices=devices,
+)
+
+add_function_test(
+    TestSolverVBD,
+    "test_vbd_positive_j_safe_and_empty",
+    _test_vbd_positive_j_safe_and_empty,
+    devices=devices,
+)
+
+add_function_test(
+    TestSolverVBD,
+    "test_vbd_positive_j_multiple_incident_tets",
+    _test_vbd_positive_j_multiple_incident_tets,
+    devices=devices,
+)
+
+add_function_test(
+    TestSolverVBD,
+    "test_vbd_positive_j_floor_branches",
+    _test_vbd_positive_j_floor_branches,
+    devices=devices,
+)
+
+add_function_test(
+    TestSolverVBD,
+    "test_vbd_positive_j_invalid_inputs",
+    _test_vbd_positive_j_invalid_inputs,
+    devices=devices,
+)
+
+add_function_test(
+    TestSolverVBD,
+    "test_vbd_positive_j_solver_paths",
+    _test_vbd_positive_j_solver_paths,
+    devices=devices,
+)
 
 
 add_function_test(

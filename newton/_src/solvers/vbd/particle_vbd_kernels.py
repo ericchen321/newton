@@ -1496,6 +1496,82 @@ def apply_conservative_bound_truncation(
         return pos_new
 
 
+@wp.func
+def _guard_vbd_accumulated_displacement(
+    particle_index: wp.int32,
+    pos: wp.array[wp.vec3],
+    collision_detection_anchor: wp.array[wp.vec3],
+    proposed_accumulated_displacement: wp.vec3,
+    tet_indices: wp.array2d[wp.int32],
+    tet_poses: wp.array[wp.mat33],
+    particle_adjacency: MeshAdjacencyData,
+):
+    """Keep one colored vertex update above the incident tet determinant floor."""
+    relative_floor_fraction = 1.0e-4
+    absolute_floor_m3 = 1.0e-12
+    small_rest_cap_fraction = 1.0e-1
+    boundary_safety_factor = 0.9
+
+    x0 = pos[particle_index]
+    anchor = collision_detection_anchor[particle_index]
+    x1 = anchor + proposed_accumulated_displacement
+    delta = x1 - x0
+    alpha = float(1.0)
+
+    for adjacent_tet in range(get_vertex_num_adjacent_tets(particle_adjacency, particle_index)):
+        tet_index, vertex_order = get_vertex_adjacent_tet_id_order(particle_adjacency, particle_index, adjacent_tet)
+        i0 = tet_indices[tet_index, 0]
+        i1 = tet_indices[tet_index, 1]
+        i2 = tet_indices[tet_index, 2]
+        i3 = tet_indices[tet_index, 3]
+        p0 = pos[i0]
+        p1 = pos[i1]
+        p2 = pos[i2]
+        p3 = pos[i3]
+        if vertex_order == 0:
+            p0 = x1
+        elif vertex_order == 1:
+            p1 = x1
+        elif vertex_order == 2:
+            p2 = x1
+        else:
+            p3 = x1
+
+        current_determinant = wp.dot(wp.cross(pos[i1] - pos[i0], pos[i2] - pos[i0]), pos[i3] - pos[i0])
+        proposed_determinant = wp.dot(wp.cross(p1 - p0, p2 - p0), p3 - p0)
+        inverse_rest_determinant = wp.determinant(tet_poses[tet_index])
+        rest_determinant = 1.0 / inverse_rest_determinant
+        determinant_floor = wp.min(
+            small_rest_cap_fraction * rest_determinant,
+            wp.max(absolute_floor_m3, relative_floor_fraction * rest_determinant),
+        )
+
+        if (
+            not wp.isfinite(rest_determinant)
+            or not wp.isfinite(current_determinant)
+            or not wp.isfinite(proposed_determinant)
+            or rest_determinant <= 0.0
+            or current_determinant <= 0.0
+            or determinant_floor <= 0.0
+        ):
+            alpha = 0.0
+        elif current_determinant <= determinant_floor:
+            alpha = 0.0
+        elif proposed_determinant < determinant_floor:
+            denominator = current_determinant - proposed_determinant
+            if denominator > 0.0 and wp.isfinite(denominator):
+                alpha_boundary = (current_determinant - determinant_floor) / denominator
+                alpha = wp.min(alpha, boundary_safety_factor * wp.clamp(alpha_boundary, 0.0, 1.0))
+            else:
+                alpha = 0.0
+
+    if alpha == 1.0:
+        return proposed_accumulated_displacement
+    if alpha == 0.0:
+        return x0 - anchor
+    return (x0 + alpha * delta) - anchor
+
+
 @wp.kernel
 def update_velocity(dt: float, pos_prev: wp.array[wp.vec3], pos: wp.array[wp.vec3], vel: wp.array[wp.vec3]):
     particle = wp.tid()
@@ -2594,6 +2670,15 @@ def solve_elasticity_tile(
                 + particle_forces[particle_index]
             )
             particle_displacements[particle_index] = particle_displacements[particle_index] + h_inv * f_total
+            particle_displacements[particle_index] = _guard_vbd_accumulated_displacement(
+                particle_index,
+                pos,
+                pos_prev,
+                particle_displacements[particle_index],
+                tet_indices,
+                tet_poses,
+                particle_adjacency,
+            )
 
 
 @wp.kernel
@@ -2735,6 +2820,15 @@ def solve_elasticity(
     if abs(wp.determinant(h)) > 1e-8:
         h_inv = wp.inverse(h)
         particle_displacements[particle_index] = particle_displacements[particle_index] + h_inv * f
+        particle_displacements[particle_index] = _guard_vbd_accumulated_displacement(
+            particle_index,
+            pos,
+            pos_prev,
+            particle_displacements[particle_index],
+            tet_indices,
+            tet_poses,
+            particle_adjacency,
+        )
 
 
 @wp.kernel
