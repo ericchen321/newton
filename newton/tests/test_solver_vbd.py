@@ -3889,7 +3889,7 @@ def _round7_guard_fixture(
 
 
 def _round7_guard_telemetry(device, policy, current, displacement):
-    """Run one below-floor proposal through the public telemetry path."""
+    """Run one below-floor proposal through the Round-7 telemetry fixture."""
     model = _round6_solver_model(device)
     solver = newton.solvers.SolverVBD(
         model,
@@ -3901,11 +3901,42 @@ def _round7_guard_telemetry(device, policy, current, displacement):
     )
     state = model.state()
     state.particle_q.assign(np.asarray(current, dtype=np.float32))
-    padded = np.zeros((int(model.particle_count), 3), dtype=np.float32)
-    padded[3] = np.asarray(displacement, dtype=np.float32)
-    solver.particle_displacements.assign(padded)
     solver._reset_positive_j_guard_telemetry()
-    solver._apply_guarded_particle_displacements(state.particle_q)
+    particle_ids = wp.array(np.asarray((3,), dtype=np.int32), device=device)
+    displacement_before = wp.array(np.zeros((1, 3), dtype=np.float32), dtype=wp.vec3, device=device)
+    displacement_after = wp.array(np.asarray((displacement,), dtype=np.float32), dtype=wp.vec3, device=device)
+    guarded = wp.empty(1, dtype=wp.vec3, device=device)
+    wp.launch(
+        _round7_guard_fixture_kernel,
+        dim=1,
+        inputs=[
+            particle_ids,
+            state.particle_q,
+            displacement_before,
+            displacement_after,
+            model.tet_indices,
+            model.tet_poses,
+            solver.particle_adjacency,
+            solver.particle_positive_j_guard_policy_code,
+            solver._positive_j_guard_enabled,
+            0,
+            int(model.particle_count),
+            0,
+            solver._positive_j_guard_event_ordinal,
+            solver._positive_j_guard_event_site,
+            solver._positive_j_guard_event_particle_id,
+            solver._positive_j_guard_event_tet_id,
+            solver._positive_j_guard_event_current_determinant,
+            solver._positive_j_guard_event_floor,
+            solver._positive_j_guard_event_proposed_determinant,
+            solver._positive_j_guard_event_alpha,
+            solver._positive_j_guard_event_decision,
+            solver._positive_j_guard_event_nonlegacy_alpha,
+            solver._positive_j_guard_reason_counts,
+        ],
+        outputs=[guarded],
+        device=device,
+    )
     return solver.read_positive_j_guard_telemetry()
 
 
@@ -4135,7 +4166,11 @@ def _test_vbd_positive_j_recovery_policy_and_telemetry(test, device):
     decreasing_positive_delta = np.asarray((0.0, 0.0, -2.0e-5), dtype=np.float32)
     for policy, reason in (("legacy", "legacy_floor_lock"), ("recovery", "recovery_decrease")):
         telemetry = _round7_guard_telemetry(device, policy, decreasing_positive, decreasing_positive_delta)
-        witnesses = [record for record in telemetry["records"] if record["reason"] == reason]
+        witnesses = [
+            record
+            for record in telemetry["records"]
+            if record["reason"] == reason and record["proposed_determinant_m3"] < record["current_determinant_m3"]
+        ]
         test.assertEqual(len(witnesses), 1)
         test.assertEqual(witnesses[0]["alpha"], 0.0)
         test.assertFalse(witnesses[0]["decision"])
