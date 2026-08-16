@@ -1672,13 +1672,18 @@ def _guard_vbd_displacement_increment(
                 else:
                     alpha = 0.0
                     nonlegacy_alpha = 0.0
-        elif policy_code == 0:
-            # Legacy behavior intentionally retains the absorbing floor lock.
-            alpha = 0.0
-        elif proposed_determinant < current_determinant:
-            # Recovery mode never admits a decreasing below-floor determinant.
-            alpha = 0.0
-            nonlegacy_alpha = 0.0
+        else:
+            if proposed_determinant < current_determinant:
+                # The counterfactual recovery policy also rejects a decreasing
+                # below-floor proposal; keep that fact truthful for legacy
+                # telemetry instead of leaving the initialized alpha at one.
+                nonlegacy_alpha = 0.0
+            if policy_code == 0:
+                # Legacy behavior intentionally retains the absorbing floor lock.
+                alpha = 0.0
+            elif proposed_determinant < current_determinant:
+                # Recovery mode never admits a decreasing below-floor determinant.
+                alpha = 0.0
 
     if telemetry_enabled:
         # Re-evaluate the incident tets only for diagnostics.  This second pass

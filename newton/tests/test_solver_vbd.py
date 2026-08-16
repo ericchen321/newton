@@ -3888,6 +3888,27 @@ def _round7_guard_fixture(
     return outputs.numpy()
 
 
+def _round7_guard_telemetry(device, policy, current, displacement):
+    """Run one below-floor proposal through the public telemetry path."""
+    model = _round6_solver_model(device)
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=1,
+        particle_positive_j_guard_policy=policy,
+        particle_positive_j_guard_telemetry=True,
+        particle_enable_tile_solve=False,
+        particle_collision_detection_interval=-1,
+    )
+    state = model.state()
+    state.particle_q.assign(np.asarray(current, dtype=np.float32))
+    padded = np.zeros((int(model.particle_count), 3), dtype=np.float32)
+    padded[3] = np.asarray(displacement, dtype=np.float32)
+    solver.particle_displacements.assign(padded)
+    solver._reset_positive_j_guard_telemetry()
+    solver._apply_guarded_particle_displacements(state.particle_q)
+    return solver.read_positive_j_guard_telemetry()
+
+
 def _round6_tet_poses(rest, tet_indices):
     """Build float32 inverse rest matrices for local tetrahedra."""
     rest = np.asarray(rest, dtype=np.float64)
@@ -4091,6 +4112,12 @@ def _test_vbd_positive_j_recovery_policy_and_telemetry(test, device):
     )[0]
     test.assertTrue(np.array_equal(legacy, np.zeros(3, dtype=np.float32)))
     test.assertTrue(np.array_equal(recovery, displacement[0]))
+    legacy_telemetry = _round7_guard_telemetry(device, "legacy", current, displacement[0])
+    legacy_witnesses = [record for record in legacy_telemetry["records"] if record["reason"] == "legacy_floor_lock"]
+    test.assertEqual(len(legacy_witnesses), 1)
+    test.assertEqual(legacy_witnesses[0]["alpha"], 0.0)
+    test.assertFalse(legacy_witnesses[0]["decision"])
+    test.assertGreater(legacy_witnesses[0]["nonlegacy_alpha"], 0.0)
     decreasing = _round7_guard_fixture(
         device,
         current,
@@ -4102,6 +4129,17 @@ def _test_vbd_positive_j_recovery_policy_and_telemetry(test, device):
         policy_code=1,
     )[0]
     test.assertTrue(np.array_equal(decreasing, np.zeros(3, dtype=np.float32)))
+
+    decreasing_positive = current.copy()
+    decreasing_positive[3, 2] = 5.0e-5
+    decreasing_positive_delta = np.asarray((0.0, 0.0, -2.0e-5), dtype=np.float32)
+    for policy, reason in (("legacy", "legacy_floor_lock"), ("recovery", "recovery_decrease")):
+        telemetry = _round7_guard_telemetry(device, policy, decreasing_positive, decreasing_positive_delta)
+        witnesses = [record for record in telemetry["records"] if record["reason"] == reason]
+        test.assertEqual(len(witnesses), 1)
+        test.assertEqual(witnesses[0]["alpha"], 0.0)
+        test.assertFalse(witnesses[0]["decision"])
+        test.assertEqual(witnesses[0]["nonlegacy_alpha"], 0.0)
 
     nonpositive = current.copy()
     nonpositive[3, 2] = 0.0
