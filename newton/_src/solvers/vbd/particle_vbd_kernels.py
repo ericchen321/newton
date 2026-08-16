@@ -1497,25 +1497,27 @@ def apply_conservative_bound_truncation(
 
 
 @wp.func
-def _guard_vbd_accumulated_displacement(
+def _guard_vbd_displacement_increment(
     particle_index: wp.int32,
     pos: wp.array[wp.vec3],
-    collision_detection_anchor: wp.array[wp.vec3],
-    proposed_accumulated_displacement: wp.vec3,
+    displacement_before: wp.vec3,
+    displacement_after: wp.vec3,
     tet_indices: wp.array2d[wp.int32],
     tet_poses: wp.array[wp.mat33],
     particle_adjacency: MeshAdjacencyData,
 ):
-    """Keep one colored vertex update above the incident tet determinant floor."""
+    """Keep one colored vertex increment above the incident tet determinant floor."""
     relative_floor_fraction = 1.0e-4
     absolute_floor_m3 = 1.0e-12
     small_rest_cap_fraction = 1.0e-1
     boundary_safety_factor = 0.9
 
+    if tet_indices.shape[0] == 0:
+        return displacement_after
+
     x0 = pos[particle_index]
-    anchor = collision_detection_anchor[particle_index]
-    x1 = anchor + proposed_accumulated_displacement
-    delta = x1 - x0
+    delta = displacement_after - displacement_before
+    x1 = x0 + delta
     alpha = float(1.0)
 
     for adjacent_tet in range(get_vertex_num_adjacent_tets(particle_adjacency, particle_index)):
@@ -1566,10 +1568,36 @@ def _guard_vbd_accumulated_displacement(
                 alpha = 0.0
 
     if alpha == 1.0:
-        return proposed_accumulated_displacement
+        return displacement_after
     if alpha == 0.0:
-        return x0 - anchor
-    return (x0 + alpha * delta) - anchor
+        return displacement_before
+    return displacement_before + alpha * delta
+
+
+@wp.kernel
+def apply_guarded_particle_displacements(
+    particle_ids_in_color: wp.array[wp.int32],
+    pos: wp.array[wp.vec3],
+    tet_indices: wp.array2d[wp.int32],
+    tet_poses: wp.array[wp.mat33],
+    particle_adjacency: MeshAdjacencyData,
+    particle_displacements: wp.array[wp.vec3],
+):
+    """Apply one already-truncated color group through the positive-J guard."""
+    particle_index = particle_ids_in_color[wp.tid()]
+    displacement_before = wp.vec3(0.0)
+    displacement_after = particle_displacements[particle_index]
+    guarded_displacement = _guard_vbd_displacement_increment(
+        particle_index,
+        pos,
+        displacement_before,
+        displacement_after,
+        tet_indices,
+        tet_poses,
+        particle_adjacency,
+    )
+    particle_displacements[particle_index] = guarded_displacement
+    pos[particle_index] = pos[particle_index] + guarded_displacement
 
 
 @wp.kernel
@@ -2669,12 +2697,13 @@ def solve_elasticity_tile(
                 + mass[particle_index] * (inertia[particle_index] - pos[particle_index]) * (dt_sqr_reciprocal)
                 + particle_forces[particle_index]
             )
-            particle_displacements[particle_index] = particle_displacements[particle_index] + h_inv * f_total
-            particle_displacements[particle_index] = _guard_vbd_accumulated_displacement(
+            displacement_before = particle_displacements[particle_index]
+            displacement_after = displacement_before + h_inv * f_total
+            particle_displacements[particle_index] = _guard_vbd_displacement_increment(
                 particle_index,
                 pos,
-                pos_prev,
-                particle_displacements[particle_index],
+                displacement_before,
+                displacement_after,
                 tet_indices,
                 tet_poses,
                 particle_adjacency,
@@ -2819,12 +2848,13 @@ def solve_elasticity(
 
     if abs(wp.determinant(h)) > 1e-8:
         h_inv = wp.inverse(h)
-        particle_displacements[particle_index] = particle_displacements[particle_index] + h_inv * f
-        particle_displacements[particle_index] = _guard_vbd_accumulated_displacement(
+        displacement_before = particle_displacements[particle_index]
+        displacement_after = displacement_before + h_inv * f
+        particle_displacements[particle_index] = _guard_vbd_displacement_increment(
             particle_index,
             pos,
-            pos_prev,
-            particle_displacements[particle_index],
+            displacement_before,
+            displacement_after,
             tet_indices,
             tet_poses,
             particle_adjacency,

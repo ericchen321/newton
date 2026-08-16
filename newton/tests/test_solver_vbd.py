@@ -12,7 +12,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.vbd.particle_vbd_kernels import (
-    _guard_vbd_accumulated_displacement,
+    _guard_vbd_displacement_increment,
     accumulate_particle_body_contact_force_and_hessian,
     evaluate_dihedral_angle_based_bending_force_hessian,
     evaluate_neo_hookean_membrane_force_hessian,
@@ -3763,11 +3763,11 @@ def _round6_tet_determinant(points):
 
 
 @wp.kernel
-def _round6_guard_fixture_kernel(
+def _round7_guard_fixture_kernel(
     particle_ids: wp.array[wp.int32],
     pos: wp.array[wp.vec3],
-    collision_detection_anchor: wp.array[wp.vec3],
-    proposed_displacements: wp.array[wp.vec3],
+    displacements_before: wp.array[wp.vec3],
+    displacements_after: wp.array[wp.vec3],
     tet_indices: wp.array2d[wp.int32],
     tet_poses: wp.array[wp.mat33],
     particle_adjacency: MeshAdjacencyData,
@@ -3775,22 +3775,22 @@ def _round6_guard_fixture_kernel(
 ):
     sample = wp.tid()
     particle = particle_ids[sample]
-    guarded_displacements[sample] = _guard_vbd_accumulated_displacement(
+    guarded_displacements[sample] = _guard_vbd_displacement_increment(
         particle,
         pos,
-        collision_detection_anchor,
-        proposed_displacements[sample],
+        displacements_before[sample],
+        displacements_after[sample],
         tet_indices,
         tet_poses,
         particle_adjacency,
     )
 
 
-def _round6_guard_fixture(
+def _round7_guard_fixture(
     device,
     pos,
-    anchor,
-    proposed,
+    displacement_before,
+    displacement_after,
     tet_indices,
     tet_poses,
     particle_ids=(0,),
@@ -3798,8 +3798,8 @@ def _round6_guard_fixture(
 ):
     """Run the guarded accumulated-displacement helper on a local fixture."""
     pos = np.asarray(pos, dtype=np.float32).reshape(-1, 3)
-    anchor = np.asarray(anchor, dtype=np.float32).reshape(-1, 3)
-    proposed = np.asarray(proposed, dtype=np.float32).reshape(-1, 3)
+    displacement_before = np.asarray(displacement_before, dtype=np.float32).reshape(-1, 3)
+    displacement_after = np.asarray(displacement_after, dtype=np.float32).reshape(-1, 3)
     tet_indices = np.asarray(tet_indices, dtype=np.int32).reshape(-1, 4)
     tet_poses = np.asarray(tet_poses, dtype=np.float32).reshape(-1, 3, 3)
     particle_ids = np.asarray(particle_ids, dtype=np.int32).reshape(-1)
@@ -3811,13 +3811,13 @@ def _round6_guard_fixture(
     adjacency_device = adjacency.to(device)
     outputs = wp.empty(particle_ids.shape[0], dtype=wp.vec3, device=device)
     wp.launch(
-        _round6_guard_fixture_kernel,
+        _round7_guard_fixture_kernel,
         dim=particle_ids.shape[0],
         inputs=[
             wp.array(particle_ids, dtype=wp.int32, device=device),
             wp.array(pos, dtype=wp.vec3, device=device),
-            wp.array(anchor, dtype=wp.vec3, device=device),
-            wp.array(proposed, dtype=wp.vec3, device=device),
+            wp.array(displacement_before, dtype=wp.vec3, device=device),
+            wp.array(displacement_after, dtype=wp.vec3, device=device),
             wp.array(tet_indices, dtype=wp.int32, device=device),
             wp.array(tet_poses, dtype=wp.mat33, device=device),
             adjacency_device,
@@ -3844,13 +3844,14 @@ def _test_vbd_positive_j(test, device):
     """Guard the frozen Clawhauser tet-2891 update above its determinant floor."""
     current = _ROUND6_TET_FAILURE_POSITIONS.copy()
     current[0] = _ROUND6_TET_REST_POSITIONS[0]
-    anchor = _ROUND6_TET_REST_POSITIONS.copy()
-    proposed = _ROUND6_TET_FAILURE_POSITIONS[0] - anchor[0]
+    displacement_before = np.zeros((1, 3), dtype=np.float32)
+    proposed = _ROUND6_TET_FAILURE_POSITIONS[0] - _ROUND6_TET_REST_POSITIONS[0]
+    displacement_after = np.asarray([proposed], dtype=np.float32)
     tet_indices = np.asarray([[0, 1, 2, 3]], dtype=np.int32)
     tet_poses = _round6_tet_poses(_ROUND6_TET_REST_POSITIONS, tet_indices)
-    guarded = _round6_guard_fixture(device, current, anchor, [proposed], tet_indices, tet_poses)[0]
+    guarded = _round7_guard_fixture(device, current, displacement_before, displacement_after, tet_indices, tet_poses)[0]
     updated = current.copy()
-    updated[0] = anchor[0] + guarded
+    updated[0] += guarded
     determinant = _round6_tet_determinant(updated)
     rest_determinant = 5.063832243853127e-09
     determinant_floor = min(0.1 * rest_determinant, max(1.0e-12, 1.0e-4 * rest_determinant))
@@ -3885,13 +3886,13 @@ def _test_vbd_positive_j_safe_and_empty(test, device):
     tet_indices = np.asarray([[0, 1, 2, 3]], dtype=np.int32)
     tet_poses = _round6_tet_poses(rest, tet_indices)
     safe_proposed = np.asarray([[0.0, 0.0, 0.01]], dtype=np.float32)
-    safe = _round6_guard_fixture(device, rest, rest, safe_proposed, tet_indices, tet_poses)[0]
+    safe = _round7_guard_fixture(device, rest, np.zeros_like(safe_proposed), safe_proposed, tet_indices, tet_poses)[0]
     test.assertTrue(np.array_equal(safe, safe_proposed[0]))
 
     no_tet_indices = np.asarray([[1, 2, 3, 4]], dtype=np.int32)
     no_tet_poses = np.zeros((1, 3, 3), dtype=np.float32)
     no_tet_proposed = np.asarray([[0.25, -0.5, 0.75]], dtype=np.float32)
-    no_tet = _round6_guard_fixture(
+    no_tet = _round7_guard_fixture(
         device,
         np.zeros((5, 3), dtype=np.float32),
         np.zeros((5, 3), dtype=np.float32),
@@ -3919,7 +3920,7 @@ def _test_vbd_positive_j_multiple_incident_tets(test, device):
     tet_indices = np.asarray(((0, 1, 2, 3), (0, 4, 5, 6)), dtype=np.int32)
     tet_poses = _round6_tet_poses(rest, tet_indices)
     proposed = np.asarray([[0.0, 0.0, 2.0]], dtype=np.float32)
-    guarded = _round6_guard_fixture(device, rest, rest, proposed, tet_indices, tet_poses)[0]
+    guarded = _round7_guard_fixture(device, rest, np.zeros_like(proposed), proposed, tet_indices, tet_poses)[0]
     accepted_fraction = float(guarded[2] / proposed[0, 2])
 
     current_determinants = _round6_guarded_determinants(rest, tet_indices)
@@ -3947,7 +3948,7 @@ def _test_vbd_positive_j_floor_branches(test, device):
         tet_indices = np.asarray([[0, 1, 2, 3]], dtype=np.int32)
         tet_poses = _round6_tet_poses(rest, tet_indices)
         proposed = np.asarray([[0.0, 0.0, 2.0 * rest_determinant]], dtype=np.float32)
-        guarded = _round6_guard_fixture(device, rest, rest, proposed, tet_indices, tet_poses)[0]
+        guarded = _round7_guard_fixture(device, rest, np.zeros_like(proposed), proposed, tet_indices, tet_poses)[0]
         accepted_fraction = float(guarded[2] / proposed[0, 2])
         expected_fraction = 0.45 * (1.0 - expected_floor / rest_determinant)
         test.assertAlmostEqual(accepted_fraction, expected_fraction, delta=3.0e-3)
@@ -3966,18 +3967,24 @@ def _test_vbd_positive_j_invalid_inputs(test, device):
     invalid_current = rest.copy()
     invalid_current[0, 2] = 2.0
     proposed = np.asarray([[0.0, 0.0, 0.25]], dtype=np.float32)
-    guarded = _round6_guard_fixture(device, invalid_current, rest, proposed, tet_indices, tet_poses)[0]
-    test.assertTrue(np.array_equal(guarded, (invalid_current[0] - rest[0]).astype(np.float32)))
+    guarded = _round7_guard_fixture(device, invalid_current, np.zeros_like(proposed), proposed, tet_indices, tet_poses)[
+        0
+    ]
+    test.assertTrue(np.array_equal(guarded, np.zeros(3, dtype=np.float32)))
     test.assertLess(_round6_tet_determinant(invalid_current), 0.0)
 
     nonfinite_current = rest.copy()
     nonfinite_current[0, 2] = np.nan
-    guarded = _round6_guard_fixture(device, nonfinite_current, rest, proposed, tet_indices, tet_poses)[0]
-    test.assertTrue(np.isnan(guarded).any())
+    guarded = _round7_guard_fixture(
+        device, nonfinite_current, np.zeros_like(proposed), proposed, tet_indices, tet_poses
+    )[0]
+    test.assertTrue(np.array_equal(guarded, np.zeros(3, dtype=np.float32)))
 
     nonfinite_rest_pose = tet_poses.copy()
     nonfinite_rest_pose[0, 0, 0] = np.nan
-    guarded = _round6_guard_fixture(device, rest, rest, proposed, tet_indices, nonfinite_rest_pose)[0]
+    guarded = _round7_guard_fixture(device, rest, np.zeros_like(proposed), proposed, tet_indices, nonfinite_rest_pose)[
+        0
+    ]
     test.assertTrue(np.array_equal(guarded, np.zeros(3, dtype=np.float32)))
     test.assertGreater(_round6_tet_determinant(rest), 0.0)
 
@@ -4037,6 +4044,172 @@ def _test_vbd_positive_j_solver_paths(test, device):
         test.assertGreater(_round6_tet_determinant(captured), 0.0)
 
 
+def _round7_predictor_step(device, apex_velocity, gravity, self_contact=False):
+    """Run one one-second predictor step for a unit tet with a dynamic apex."""
+    builder = newton.ModelBuilder(gravity=gravity)
+    builder.add_particle(pos=wp.vec3(0.0, 0.0, 0.0), vel=wp.vec3(0.0), mass=0.0)
+    builder.add_particle(pos=wp.vec3(1.0, 0.0, 0.0), vel=wp.vec3(0.0), mass=0.0)
+    builder.add_particle(pos=wp.vec3(0.0, 1.0, 0.0), vel=wp.vec3(0.0), mass=0.0)
+    builder.add_particle(pos=wp.vec3(0.0, 0.0, 1.0), vel=wp.vec3(*apex_velocity), mass=1.0)
+    builder.add_tetrahedron(0, 1, 2, 3, k_mu=1.0, k_lambda=1.0, k_damp=0.0)
+    color_groups = [[0], [1], [2], [3]]
+    if self_contact:
+        triangle_start = builder.add_particle(pos=wp.vec3(10.0, 10.0, 10.0), vel=wp.vec3(0.0), mass=0.0)
+        triangle_middle = builder.add_particle(pos=wp.vec3(11.0, 10.0, 10.0), vel=wp.vec3(0.0), mass=0.0)
+        triangle_end = builder.add_particle(pos=wp.vec3(10.0, 11.0, 10.0), vel=wp.vec3(0.0), mass=0.0)
+        builder.add_triangle(triangle_start, triangle_middle, triangle_end)
+        color_groups.extend([[triangle_start], [triangle_middle], [triangle_end]])
+    builder.set_coloring(color_groups)
+    model = builder.finalize(device=device)
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=1,
+        particle_enable_self_contact=self_contact,
+        particle_enable_tile_solve=False,
+        particle_collision_detection_interval=-1,
+    )
+    state_in = model.state()
+    state_out = model.state()
+    velocity = np.zeros((model.particle_count, 3), dtype=np.float32)
+    velocity[3] = apex_velocity
+    state_in.particle_qd.assign(velocity)
+    solver.step(state_in, state_out, model.control(clone_variables=False), None, 1.0)
+    return state_out.particle_q.numpy().copy()
+
+
+def _test_vbd_positive_j_predictor_velocity(test, device):
+    """Guard a one-second apex velocity predictor before it crosses the base."""
+    output = _round7_predictor_step(device, (0.0, 0.0, -2.0), (0.0, 0.0, 0.0))
+    determinant = _round6_tet_determinant(output)
+    test.assertGreater(determinant, 1.0e-4)
+
+
+def _test_vbd_positive_j_predictor_gravity(test, device):
+    """Guard a one-second gravity predictor before it crosses the base."""
+    output = _round7_predictor_step(device, (0.0, 0.0, 0.0), (0.0, 0.0, -2.0))
+    determinant = _round6_tet_determinant(output)
+    test.assertGreater(determinant, 1.0e-4)
+
+
+def _round7_multicolor_predictor_step(device, color_groups):
+    """Run the two-moving-vertex predictor for one explicit color order."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    builder.add_particle(pos=wp.vec3(0.0, 0.0, 0.0), vel=wp.vec3(0.0), mass=1.0)
+    builder.add_particle(pos=wp.vec3(1.0, 0.0, 0.0), vel=wp.vec3(0.0), mass=0.0)
+    builder.add_particle(pos=wp.vec3(0.0, 1.0, 0.0), vel=wp.vec3(0.0), mass=0.0)
+    builder.add_particle(pos=wp.vec3(0.0, 0.0, 1.0), vel=wp.vec3(0.0), mass=1.0)
+    builder.add_tetrahedron(0, 1, 2, 3, k_mu=0.0, k_lambda=0.0, k_damp=0.0)
+    builder.set_coloring(color_groups)
+    model = builder.finalize(device=device)
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=1,
+        particle_enable_tile_solve=False,
+        particle_collision_detection_interval=-1,
+    )
+    state_in = model.state()
+    state_out = model.state()
+    state_in.particle_qd.assign(
+        np.asarray(((0.0, 0.0, 0.6), (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), (0.0, 0.0, -0.6)), dtype=np.float32)
+    )
+    solver.step(state_in, state_out, model.control(clone_variables=False), None, 1.0)
+    return state_out.particle_q.numpy().copy()
+
+
+def _test_vbd_positive_j_multicolor_predictor(test, device):
+    """Apply inversion-prone candidates sequentially in both valid color orders."""
+    all_at_once = np.asarray(((0.0, 0.0, 0.6), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 0.4)), dtype=np.float64)
+    test.assertAlmostEqual(_round6_tet_determinant(all_at_once), -0.2, places=6)
+    forward = _round7_multicolor_predictor_step(device, [[0], [1], [2], [3]])
+    reverse = _round7_multicolor_predictor_step(device, [[3], [1], [2], [0]])
+    test.assertGreater(_round6_tet_determinant(forward), 1.0e-4)
+    test.assertGreater(_round6_tet_determinant(reverse), 1.0e-4)
+    repeated = _round7_multicolor_predictor_step(device, [[0], [1], [2], [3]])
+    test.assertTrue(np.array_equal(forward, repeated))
+
+
+def _test_vbd_positive_j_self_contact_paths(test, device):
+    """Guard a self-contact-configured candidate through the shared color apply kernel."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    for position, mass in (
+        ((0.0, 0.0, 0.0), 0.0),
+        ((1.0, 0.0, 0.0), 0.0),
+        ((0.0, 1.0, 0.0), 0.0),
+        ((0.0, 0.0, 1.0), 1.0),
+    ):
+        builder.add_particle(pos=wp.vec3(*position), vel=wp.vec3(0.0), mass=mass)
+    builder.add_tetrahedron(0, 1, 2, 3, k_mu=1.0, k_lambda=1.0, k_damp=0.0)
+    builder.set_coloring([[0], [1], [2], [3]])
+    model = builder.finalize(device=device)
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=1,
+        particle_enable_self_contact=True,
+        particle_enable_tile_solve=False,
+        particle_collision_detection_interval=-1,
+    )
+    state = model.state()
+    candidate = np.zeros((4, 3), dtype=np.float32)
+    candidate[3, 2] = -2.0
+    solver.particle_displacements.assign(candidate)
+    before = state.particle_q.numpy().copy()
+    solver._apply_guarded_particle_displacements(state.particle_q)
+    output = state.particle_q.numpy().copy()
+    test.assertTrue(np.array_equal(before, model.particle_q.numpy()))
+    test.assertGreater(_round6_tet_determinant(output), 1.0e-4)
+
+
+def _test_vbd_positive_j_increment_anchor_independence(test, device):
+    """Accept the same physical increment independently of accumulated history."""
+    rest = _round6_scaled_tet(1.0)
+    tet_indices = np.asarray([[0, 1, 2, 3]], dtype=np.int32)
+    tet_poses = _round6_tet_poses(rest, tet_indices)
+    before_a = np.asarray([[0.0, 0.0, 0.0]], dtype=np.float32)
+    after_a = np.asarray([[0.0, 0.0, 2.0]], dtype=np.float32)
+    before_b = np.asarray([[0.0, 0.0, 0.25]], dtype=np.float32)
+    after_b = np.asarray([[0.0, 0.0, 2.25]], dtype=np.float32)
+    accepted_a = _round7_guard_fixture(device, rest, before_a, after_a, tet_indices, tet_poses)[0]
+    accepted_b = _round7_guard_fixture(device, rest, before_b, after_b, tet_indices, tet_poses)[0]
+    test.assertTrue(np.array_equal(accepted_a - before_a[0], accepted_b - before_b[0]))
+
+
+def _round7_coloring_model(device):
+    """Build a valid unit tet model whose color groups can be replaced for validation tests."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    for position in ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)):
+        builder.add_particle(pos=wp.vec3(*position), vel=wp.vec3(0.0), mass=1.0)
+    builder.add_tetrahedron(0, 1, 2, 3, k_mu=1.0, k_lambda=1.0, k_damp=0.0)
+    builder.color()
+    return builder.finalize(device=device)
+
+
+def _test_vbd_positive_j_color_invariants(test, device):
+    """Accept valid colorings and reject malformed partitions before stepping."""
+    valid_builder_model = _round7_coloring_model(device)
+    newton.solvers.SolverVBD(valid_builder_model, iterations=1)
+
+    explicit_model = _round7_coloring_model(device)
+    explicit_model.particle_color_groups = [
+        wp.array(np.asarray(group, dtype=np.int32), dtype=wp.int32, device=device) for group in ((0,), (1,), (2,), (3,))
+    ]
+    newton.solvers.SolverVBD(explicit_model, iterations=1)
+
+    malformed_groups = (
+        ("empty", ((), (1,), (2,), (3,))),
+        ("incomplete", ((0,), (1,), (2,))),
+        ("duplicate", ((0,), (1,), (2,), (3, 3))),
+        ("out-of-range", ((0,), (1,), (2,), (3, 4))),
+        ("same-tet-color", ((0, 1), (2,), (3,))),
+    )
+    for _label, groups in malformed_groups:
+        model = _round7_coloring_model(device)
+        model.particle_color_groups = [
+            wp.array(np.asarray(group, dtype=np.int32), dtype=wp.int32, device=device) for group in groups
+        ]
+        with test.assertRaisesRegex(ValueError, "particle|tet"):
+            newton.solvers.SolverVBD(model, iterations=1)
+
+
 class TestSolverVBD(unittest.TestCase):
     pass
 
@@ -4080,6 +4253,48 @@ add_function_test(
     TestSolverVBD,
     "test_vbd_positive_j_solver_paths",
     _test_vbd_positive_j_solver_paths,
+    devices=devices,
+)
+
+add_function_test(
+    TestSolverVBD,
+    "test_vbd_positive_j_predictor_velocity",
+    _test_vbd_positive_j_predictor_velocity,
+    devices=devices,
+)
+
+add_function_test(
+    TestSolverVBD,
+    "test_vbd_positive_j_predictor_gravity",
+    _test_vbd_positive_j_predictor_gravity,
+    devices=devices,
+)
+
+add_function_test(
+    TestSolverVBD,
+    "test_vbd_positive_j_multicolor_predictor",
+    _test_vbd_positive_j_multicolor_predictor,
+    devices=devices,
+)
+
+add_function_test(
+    TestSolverVBD,
+    "test_vbd_positive_j_self_contact_paths",
+    _test_vbd_positive_j_self_contact_paths,
+    devices=[device for device in devices if device.is_cpu],
+)
+
+add_function_test(
+    TestSolverVBD,
+    "test_vbd_positive_j_increment_anchor_independence",
+    _test_vbd_positive_j_increment_anchor_independence,
+    devices=devices,
+)
+
+add_function_test(
+    TestSolverVBD,
+    "test_vbd_positive_j_color_invariants",
+    _test_vbd_positive_j_color_invariants,
     devices=devices,
 )
 

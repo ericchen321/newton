@@ -38,6 +38,7 @@ from .particle_vbd_kernels import (
     accumulate_self_contact_force_and_hessian,
     accumulate_spring_force_and_hessian,
     # Planar DAT (Divide and Truncate) kernels
+    apply_guarded_particle_displacements,
     apply_planar_truncation_parallel_by_collision,
     apply_truncation_ts,
     # Solver kernels (particle VBD)
@@ -669,6 +670,8 @@ class SolverVBD(SolverBase, CouplingInterface):
         if model.particle_count == 0:
             return
 
+        self._validate_particle_coloring(model)
+
         self.particle_collision_detection_interval = particle_collision_detection_interval
         self.particle_topological_contact_filter_threshold = particle_topological_contact_filter_threshold
         self.particle_rest_shape_contact_exclusion_radius = particle_rest_shape_contact_exclusion_radius
@@ -732,16 +735,52 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.particle_forces = wp.zeros(self.model.particle_count, dtype=wp.vec3, device=self.device)
         self.particle_hessians = wp.zeros(self.model.particle_count, dtype=wp.mat33, device=self.device)
 
-        # Validation
-        if len(self.model.particle_color_groups) == 0:
+        self.pos_prev_collision_detection = wp.zeros_like(model.particle_q, device=self.device)
+        self.particle_displacements = wp.zeros(self.model.particle_count, dtype=wp.vec3, device=self.device)
+        self.truncation_ts = wp.zeros(self.model.particle_count, dtype=float, device=self.device)
+
+    @staticmethod
+    def _validate_particle_coloring(model: Model) -> None:
+        """Require an exact particle partition with at most one tet vertex per color."""
+        color_groups = model.particle_color_groups
+        if len(color_groups) == 0:
             raise ValueError(
                 "model.particle_color_groups is empty! When using the SolverVBD you must call ModelBuilder.color() "
                 "or ModelBuilder.set_coloring() before calling ModelBuilder.finalize()."
             )
 
-        self.pos_prev_collision_detection = wp.zeros_like(model.particle_q, device=self.device)
-        self.particle_displacements = wp.zeros(self.model.particle_count, dtype=wp.vec3, device=self.device)
-        self.truncation_ts = wp.zeros(self.model.particle_count, dtype=float, device=self.device)
+        particle_colors = np.full(model.particle_count, -1, dtype=np.int32)
+        for color, group in enumerate(color_groups):
+            particle_ids = np.asarray(group.numpy(), dtype=np.int64).reshape(-1)
+            if particle_ids.size == 0:
+                raise ValueError(f"model.particle_color_groups[{color}] is empty")
+            for particle_index in particle_ids:
+                if particle_index < 0 or particle_index >= model.particle_count:
+                    raise ValueError(
+                        f"model.particle_color_groups[{color}] contains out-of-range particle {particle_index}"
+                    )
+                if particle_colors[particle_index] != -1:
+                    raise ValueError(f"particle {particle_index} appears in multiple particle color groups")
+                particle_colors[particle_index] = color
+
+        missing = np.flatnonzero(particle_colors == -1)
+        if missing.size:
+            raise ValueError(f"particle color groups omit particle {int(missing[0])}")
+
+        if model.tet_count == 0:
+            return
+        tet_indices = np.asarray(model.tet_indices.numpy(), dtype=np.int64).reshape(-1, 4)
+        for tet_index, tet in enumerate(tet_indices):
+            if np.any(tet < 0) or np.any(tet >= model.particle_count):
+                raise ValueError(f"tet {tet_index} contains an out-of-range particle index")
+            colors = particle_colors[tet]
+            for local_index in range(4):
+                for other_index in range(local_index):
+                    if colors[local_index] == colors[other_index]:
+                        raise ValueError(
+                            f"tet {tet_index} contains particles {int(tet[other_index])} and "
+                            f"{int(tet[local_index])} in the same particle color"
+                        )
 
     def _init_rigid_system(
         self,
@@ -2362,6 +2401,23 @@ class SolverVBD(SolverBase, CouplingInterface):
                 device=self.device,
             )
 
+    def _apply_guarded_particle_displacements(self, particle_q):
+        """Apply the initialized candidate one existing particle color at a time."""
+        for color_group in self.model.particle_color_groups:
+            wp.launch(
+                kernel=apply_guarded_particle_displacements,
+                dim=color_group.size,
+                inputs=[
+                    color_group,
+                    particle_q,
+                    self.model.tet_indices,
+                    self.model.tet_poses,
+                    self.particle_adjacency,
+                ],
+                outputs=[self.particle_displacements],
+                device=self.device,
+            )
+
     def _initialize_particles(self, state_in: State, state_out: State, dt: float):
         """Initialize particle positions for the VBD iteration."""
         model = self.model
@@ -2398,7 +2454,8 @@ class SolverVBD(SolverBase, CouplingInterface):
             device=self.device,
         )
 
-        self._penetration_free_truncation(state_in.particle_q)
+        self._penetration_free_truncation()
+        self._apply_guarded_particle_displacements(state_in.particle_q)
 
     def _initialize_rigid_bodies(
         self,
