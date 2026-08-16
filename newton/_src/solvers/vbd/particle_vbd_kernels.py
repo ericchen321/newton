@@ -53,6 +53,20 @@ NUM_THREADS_PER_COLLISION_PRIMITIVE = 4
 TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE = 16
 TILE_SIZE_SELF_CONTACT_SOLVE = 8
 
+# Positive-J guard telemetry uses one stable slot per reason and tetrahedron.
+# Keep these values in one place so host decoding and device writes share the
+# same deterministic layout.
+POSITIVE_J_GUARD_REASON_INVALID_INPUT = 0
+POSITIVE_J_GUARD_REASON_LEGACY_FLOOR_LOCK = 1
+POSITIVE_J_GUARD_REASON_RECOVERY_DECREASE = 2
+POSITIVE_J_GUARD_REASON_FRACTION_TO_BOUNDARY = 3
+POSITIVE_J_GUARD_REASON_RECOVERY_NONWORSENING = 4
+POSITIVE_J_GUARD_REASON_COUNT = 5
+POSITIVE_J_GUARD_SITE_INITIALIZER = 0
+POSITIVE_J_GUARD_SITE_TILE = 1
+POSITIVE_J_GUARD_SITE_SCALAR = 2
+POSITIVE_J_GUARD_EVENT_ORDINAL_MAX = 2**31 - 1
+
 
 class mat32(wp.types.matrix(shape=(3, 2), dtype=wp.float32)):
     pass
@@ -1496,6 +1510,77 @@ def apply_conservative_bound_truncation(
         return pos_new
 
 
+@wp.kernel
+def reset_positive_j_guard_telemetry(
+    event_ordinal: wp.array[wp.int32],
+    event_site: wp.array[wp.int32],
+    event_particle_id: wp.array[wp.int32],
+    event_tet_id: wp.array[wp.int32],
+    event_current_determinant: wp.array[float],
+    event_floor: wp.array[float],
+    event_proposed_determinant: wp.array[float],
+    event_alpha: wp.array[float],
+    event_decision: wp.array[wp.int32],
+    event_nonlegacy_alpha: wp.array[float],
+    reason_counts: wp.array[wp.int32],
+):
+    slot = wp.tid()
+    if slot < event_ordinal.shape[0]:
+        event_ordinal[slot] = POSITIVE_J_GUARD_EVENT_ORDINAL_MAX
+        event_site[slot] = -1
+        event_particle_id[slot] = -1
+        event_tet_id[slot] = -1
+        event_current_determinant[slot] = 0.0
+        event_floor[slot] = 0.0
+        event_proposed_determinant[slot] = 0.0
+        event_alpha[slot] = 0.0
+        event_decision[slot] = 0
+        event_nonlegacy_alpha[slot] = 0.0
+    if slot < POSITIVE_J_GUARD_REASON_COUNT:
+        reason_counts[slot] = 0
+
+
+@wp.func
+def _record_positive_j_guard_event(
+    reason: int,
+    site: int,
+    particle_index: wp.int32,
+    tet_index: wp.int32,
+    current_determinant: float,
+    determinant_floor: float,
+    proposed_determinant: float,
+    alpha: float,
+    nonlegacy_alpha: float,
+    pass_ordinal: int,
+    particle_count: int,
+    event_ordinal: wp.array[wp.int32],
+    event_site: wp.array[wp.int32],
+    event_particle_id: wp.array[wp.int32],
+    event_tet_id: wp.array[wp.int32],
+    event_current_determinant: wp.array[float],
+    event_floor: wp.array[float],
+    event_proposed_determinant: wp.array[float],
+    event_alpha: wp.array[float],
+    event_decision: wp.array[wp.int32],
+    event_nonlegacy_alpha: wp.array[float],
+    reason_counts: wp.array[wp.int32],
+):
+    slot = tet_index * POSITIVE_J_GUARD_REASON_COUNT + reason
+    ordinal = pass_ordinal * particle_count + particle_index
+    previous = wp.atomic_min(event_ordinal, slot, ordinal)
+    if previous > ordinal:
+        event_site[slot] = site
+        event_particle_id[slot] = particle_index
+        event_tet_id[slot] = tet_index
+        event_current_determinant[slot] = current_determinant
+        event_floor[slot] = determinant_floor
+        event_proposed_determinant[slot] = proposed_determinant
+        event_alpha[slot] = alpha
+        event_decision[slot] = int(alpha > 0.0)
+        event_nonlegacy_alpha[slot] = nonlegacy_alpha
+    wp.atomic_add(reason_counts, reason, 1)
+
+
 @wp.func
 def _guard_vbd_displacement_increment(
     particle_index: wp.int32,
@@ -1505,6 +1590,22 @@ def _guard_vbd_displacement_increment(
     tet_indices: wp.array2d[wp.int32],
     tet_poses: wp.array[wp.mat33],
     particle_adjacency: MeshAdjacencyData,
+    policy_code: int,
+    telemetry_enabled: bool,
+    pass_ordinal: int,
+    particle_count: int,
+    site: int,
+    event_ordinal: wp.array[wp.int32],
+    event_site: wp.array[wp.int32],
+    event_particle_id: wp.array[wp.int32],
+    event_tet_id: wp.array[wp.int32],
+    event_current_determinant: wp.array[float],
+    event_floor: wp.array[float],
+    event_proposed_determinant: wp.array[float],
+    event_alpha: wp.array[float],
+    event_decision: wp.array[wp.int32],
+    event_nonlegacy_alpha: wp.array[float],
+    reason_counts: wp.array[wp.int32],
 ):
     """Keep one colored vertex increment above the incident tet determinant floor."""
     relative_floor_fraction = 1.0e-4
@@ -1519,6 +1620,7 @@ def _guard_vbd_displacement_increment(
     delta = displacement_after - displacement_before
     x1 = x0 + delta
     alpha = float(1.0)
+    nonlegacy_alpha = float(1.0)
 
     for adjacent_tet in range(get_vertex_num_adjacent_tets(particle_adjacency, particle_index)):
         tet_index, vertex_order = get_vertex_adjacent_tet_id_order(particle_adjacency, particle_index, adjacent_tet)
@@ -1552,20 +1654,111 @@ def _guard_vbd_displacement_increment(
             not wp.isfinite(rest_determinant)
             or not wp.isfinite(current_determinant)
             or not wp.isfinite(proposed_determinant)
+            or not wp.isfinite(determinant_floor)
             or rest_determinant <= 0.0
             or current_determinant <= 0.0
             or determinant_floor <= 0.0
         ):
             alpha = 0.0
-        elif current_determinant <= determinant_floor:
+            nonlegacy_alpha = 0.0
+        elif current_determinant > determinant_floor:
+            if proposed_determinant < determinant_floor:
+                denominator = current_determinant - proposed_determinant
+                if denominator > 0.0 and wp.isfinite(denominator):
+                    alpha_boundary = (current_determinant - determinant_floor) / denominator
+                    bound = boundary_safety_factor * wp.clamp(alpha_boundary, 0.0, 1.0)
+                    alpha = wp.min(alpha, bound)
+                    nonlegacy_alpha = wp.min(nonlegacy_alpha, bound)
+                else:
+                    alpha = 0.0
+                    nonlegacy_alpha = 0.0
+        elif policy_code == 0:
+            # Legacy behavior intentionally retains the absorbing floor lock.
             alpha = 0.0
-        elif proposed_determinant < determinant_floor:
-            denominator = current_determinant - proposed_determinant
-            if denominator > 0.0 and wp.isfinite(denominator):
-                alpha_boundary = (current_determinant - determinant_floor) / denominator
-                alpha = wp.min(alpha, boundary_safety_factor * wp.clamp(alpha_boundary, 0.0, 1.0))
+        elif proposed_determinant < current_determinant:
+            # Recovery mode never admits a decreasing below-floor determinant.
+            alpha = 0.0
+            nonlegacy_alpha = 0.0
+
+    if telemetry_enabled:
+        # Re-evaluate the incident tets only for diagnostics.  This second pass
+        # records the final alpha and the non-legacy bound after all safety and
+        # fraction checks, while leaving the policy calculation above untouched.
+        for adjacent_tet in range(get_vertex_num_adjacent_tets(particle_adjacency, particle_index)):
+            tet_index, vertex_order = get_vertex_adjacent_tet_id_order(particle_adjacency, particle_index, adjacent_tet)
+            i0 = tet_indices[tet_index, 0]
+            i1 = tet_indices[tet_index, 1]
+            i2 = tet_indices[tet_index, 2]
+            i3 = tet_indices[tet_index, 3]
+            p0 = pos[i0]
+            p1 = pos[i1]
+            p2 = pos[i2]
+            p3 = pos[i3]
+            if vertex_order == 0:
+                p0 = x1
+            elif vertex_order == 1:
+                p1 = x1
+            elif vertex_order == 2:
+                p2 = x1
             else:
-                alpha = 0.0
+                p3 = x1
+            current_determinant = wp.dot(wp.cross(pos[i1] - pos[i0], pos[i2] - pos[i0]), pos[i3] - pos[i0])
+            proposed_determinant = wp.dot(wp.cross(p1 - p0, p2 - p0), p3 - p0)
+            rest_determinant = 1.0 / wp.determinant(tet_poses[tet_index])
+            determinant_floor = wp.min(
+                small_rest_cap_fraction * rest_determinant,
+                wp.max(absolute_floor_m3, relative_floor_fraction * rest_determinant),
+            )
+            if (
+                not wp.isfinite(rest_determinant)
+                or not wp.isfinite(current_determinant)
+                or not wp.isfinite(proposed_determinant)
+                or not wp.isfinite(determinant_floor)
+                or rest_determinant <= 0.0
+                or current_determinant <= 0.0
+                or determinant_floor <= 0.0
+            ):
+                reason = POSITIVE_J_GUARD_REASON_INVALID_INPUT
+            elif current_determinant <= determinant_floor:
+                if policy_code == 0:
+                    reason = POSITIVE_J_GUARD_REASON_LEGACY_FLOOR_LOCK
+                elif proposed_determinant < current_determinant:
+                    reason = POSITIVE_J_GUARD_REASON_RECOVERY_DECREASE
+                else:
+                    reason = POSITIVE_J_GUARD_REASON_RECOVERY_NONWORSENING
+            elif proposed_determinant < determinant_floor:
+                denominator = current_determinant - proposed_determinant
+                if denominator > 0.0 and wp.isfinite(denominator):
+                    reason = POSITIVE_J_GUARD_REASON_FRACTION_TO_BOUNDARY
+                else:
+                    reason = POSITIVE_J_GUARD_REASON_INVALID_INPUT
+            else:
+                reason = -1
+            if reason >= 0:
+                _record_positive_j_guard_event(
+                    reason,
+                    site,
+                    particle_index,
+                    tet_index,
+                    current_determinant,
+                    determinant_floor,
+                    proposed_determinant,
+                    alpha,
+                    nonlegacy_alpha,
+                    pass_ordinal,
+                    particle_count,
+                    event_ordinal,
+                    event_site,
+                    event_particle_id,
+                    event_tet_id,
+                    event_current_determinant,
+                    event_floor,
+                    event_proposed_determinant,
+                    event_alpha,
+                    event_decision,
+                    event_nonlegacy_alpha,
+                    reason_counts,
+                )
 
     if alpha == 1.0:
         return displacement_after
@@ -1581,6 +1774,22 @@ def apply_guarded_particle_displacements(
     tet_indices: wp.array2d[wp.int32],
     tet_poses: wp.array[wp.mat33],
     particle_adjacency: MeshAdjacencyData,
+    policy_code: int,
+    telemetry_enabled: bool,
+    pass_ordinal: int,
+    particle_count: int,
+    site: int,
+    event_ordinal: wp.array[wp.int32],
+    event_site: wp.array[wp.int32],
+    event_particle_id: wp.array[wp.int32],
+    event_tet_id: wp.array[wp.int32],
+    event_current_determinant: wp.array[float],
+    event_floor: wp.array[float],
+    event_proposed_determinant: wp.array[float],
+    event_alpha: wp.array[float],
+    event_decision: wp.array[wp.int32],
+    event_nonlegacy_alpha: wp.array[float],
+    reason_counts: wp.array[wp.int32],
     particle_displacements: wp.array[wp.vec3],
 ):
     """Apply one already-truncated color group through the positive-J guard."""
@@ -1595,6 +1804,22 @@ def apply_guarded_particle_displacements(
         tet_indices,
         tet_poses,
         particle_adjacency,
+        policy_code,
+        telemetry_enabled,
+        pass_ordinal,
+        particle_count,
+        site,
+        event_ordinal,
+        event_site,
+        event_particle_id,
+        event_tet_id,
+        event_current_determinant,
+        event_floor,
+        event_proposed_determinant,
+        event_alpha,
+        event_decision,
+        event_nonlegacy_alpha,
+        reason_counts,
     )
     particle_displacements[particle_index] = guarded_displacement
     pos[particle_index] = pos[particle_index] + guarded_displacement
@@ -2559,6 +2784,22 @@ def solve_elasticity_tile(
     particle_adjacency: MeshAdjacencyData,
     particle_forces: wp.array[wp.vec3],
     particle_hessians: wp.array[wp.mat33],
+    policy_code: int,
+    telemetry_enabled: bool,
+    pass_ordinal: int,
+    particle_count: int,
+    site: int,
+    event_ordinal: wp.array[wp.int32],
+    event_site: wp.array[wp.int32],
+    event_particle_id: wp.array[wp.int32],
+    event_tet_id: wp.array[wp.int32],
+    event_current_determinant: wp.array[float],
+    event_floor: wp.array[float],
+    event_proposed_determinant: wp.array[float],
+    event_alpha: wp.array[float],
+    event_decision: wp.array[wp.int32],
+    event_nonlegacy_alpha: wp.array[float],
+    reason_counts: wp.array[wp.int32],
     # output
     particle_displacements: wp.array[wp.vec3],
 ):
@@ -2707,6 +2948,22 @@ def solve_elasticity_tile(
                 tet_indices,
                 tet_poses,
                 particle_adjacency,
+                policy_code,
+                telemetry_enabled,
+                pass_ordinal,
+                particle_count,
+                site,
+                event_ordinal,
+                event_site,
+                event_particle_id,
+                event_tet_id,
+                event_current_determinant,
+                event_floor,
+                event_proposed_determinant,
+                event_alpha,
+                event_decision,
+                event_nonlegacy_alpha,
+                reason_counts,
             )
 
 
@@ -2733,6 +2990,22 @@ def solve_elasticity(
     particle_adjacency: MeshAdjacencyData,
     particle_forces: wp.array[wp.vec3],
     particle_hessians: wp.array[wp.mat33],
+    policy_code: int,
+    telemetry_enabled: bool,
+    pass_ordinal: int,
+    particle_count: int,
+    site: int,
+    event_ordinal: wp.array[wp.int32],
+    event_site: wp.array[wp.int32],
+    event_particle_id: wp.array[wp.int32],
+    event_tet_id: wp.array[wp.int32],
+    event_current_determinant: wp.array[float],
+    event_floor: wp.array[float],
+    event_proposed_determinant: wp.array[float],
+    event_alpha: wp.array[float],
+    event_decision: wp.array[wp.int32],
+    event_nonlegacy_alpha: wp.array[float],
+    reason_counts: wp.array[wp.int32],
     # output
     particle_displacements: wp.array[wp.vec3],
 ):
@@ -2858,6 +3131,22 @@ def solve_elasticity(
             tet_indices,
             tet_poses,
             particle_adjacency,
+            policy_code,
+            telemetry_enabled,
+            pass_ordinal,
+            particle_count,
+            site,
+            event_ordinal,
+            event_site,
+            event_particle_id,
+            event_tet_id,
+            event_current_determinant,
+            event_floor,
+            event_proposed_determinant,
+            event_alpha,
+            event_decision,
+            event_nonlegacy_alpha,
+            reason_counts,
         )
 
 

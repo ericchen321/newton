@@ -3771,6 +3771,22 @@ def _round7_guard_fixture_kernel(
     tet_indices: wp.array2d[wp.int32],
     tet_poses: wp.array[wp.mat33],
     particle_adjacency: MeshAdjacencyData,
+    policy_code: int,
+    telemetry_enabled: bool,
+    pass_ordinal: int,
+    particle_count: int,
+    site: int,
+    event_ordinal: wp.array[wp.int32],
+    event_site: wp.array[wp.int32],
+    event_particle_id: wp.array[wp.int32],
+    event_tet_id: wp.array[wp.int32],
+    event_current_determinant: wp.array[float],
+    event_floor: wp.array[float],
+    event_proposed_determinant: wp.array[float],
+    event_alpha: wp.array[float],
+    event_decision: wp.array[wp.int32],
+    event_nonlegacy_alpha: wp.array[float],
+    reason_counts: wp.array[wp.int32],
     guarded_displacements: wp.array[wp.vec3],
 ):
     sample = wp.tid()
@@ -3783,6 +3799,22 @@ def _round7_guard_fixture_kernel(
         tet_indices,
         tet_poses,
         particle_adjacency,
+        policy_code,
+        telemetry_enabled,
+        pass_ordinal,
+        particle_count,
+        site,
+        event_ordinal,
+        event_site,
+        event_particle_id,
+        event_tet_id,
+        event_current_determinant,
+        event_floor,
+        event_proposed_determinant,
+        event_alpha,
+        event_decision,
+        event_nonlegacy_alpha,
+        reason_counts,
     )
 
 
@@ -3795,6 +3827,7 @@ def _round7_guard_fixture(
     tet_poses,
     particle_ids=(0,),
     adjacency_tet_indices=None,
+    policy_code=0,
 ):
     """Run the guarded accumulated-displacement helper on a local fixture."""
     pos = np.asarray(pos, dtype=np.float32).reshape(-1, 3)
@@ -3809,6 +3842,17 @@ def _round7_guard_fixture(
     adjacency = MeshAdjacency(tet_indices=adjacency_tet_indices)
     adjacency.init_vertex_adjacency(pos.shape[0])
     adjacency_device = adjacency.to(device)
+    event_ordinal = wp.empty(0, dtype=wp.int32, device=device)
+    event_site = wp.empty(0, dtype=wp.int32, device=device)
+    event_particle_id = wp.empty(0, dtype=wp.int32, device=device)
+    event_tet_id = wp.empty(0, dtype=wp.int32, device=device)
+    event_current_determinant = wp.empty(0, dtype=float, device=device)
+    event_floor = wp.empty(0, dtype=float, device=device)
+    event_proposed_determinant = wp.empty(0, dtype=float, device=device)
+    event_alpha = wp.empty(0, dtype=float, device=device)
+    event_decision = wp.empty(0, dtype=wp.int32, device=device)
+    event_nonlegacy_alpha = wp.empty(0, dtype=float, device=device)
+    reason_counts = wp.empty(0, dtype=wp.int32, device=device)
     outputs = wp.empty(particle_ids.shape[0], dtype=wp.vec3, device=device)
     wp.launch(
         _round7_guard_fixture_kernel,
@@ -3821,6 +3865,22 @@ def _round7_guard_fixture(
             wp.array(tet_indices, dtype=wp.int32, device=device),
             wp.array(tet_poses, dtype=wp.mat33, device=device),
             adjacency_device,
+            policy_code,
+            False,
+            0,
+            pos.shape[0],
+            2,
+            event_ordinal,
+            event_site,
+            event_particle_id,
+            event_tet_id,
+            event_current_determinant,
+            event_floor,
+            event_proposed_determinant,
+            event_alpha,
+            event_decision,
+            event_nonlegacy_alpha,
+            reason_counts,
         ],
         outputs=[outputs],
         device=device,
@@ -3987,6 +4047,130 @@ def _test_vbd_positive_j_invalid_inputs(test, device):
     ]
     test.assertTrue(np.array_equal(guarded, np.zeros(3, dtype=np.float32)))
     test.assertGreater(_round6_tet_determinant(rest), 0.0)
+
+
+def _test_vbd_positive_j_recovery_policy_and_telemetry(test, device):
+    """Allow only non-worsening below-floor recovery and expose one deterministic witness."""
+    model_for_validation = _round6_solver_model(device)
+    default_solver = newton.solvers.SolverVBD(model_for_validation, iterations=1)
+    test.assertEqual(default_solver.particle_positive_j_guard_policy, "legacy")
+    test.assertFalse(default_solver.particle_positive_j_guard_telemetry)
+    with test.assertRaises(TypeError):
+        newton.solvers.SolverVBD(model_for_validation, particle_positive_j_guard_policy=1)
+    with test.assertRaises(ValueError):
+        newton.solvers.SolverVBD(model_for_validation, particle_positive_j_guard_policy="unsupported")
+    with test.assertRaises(TypeError):
+        newton.solvers.SolverVBD(model_for_validation, particle_positive_j_guard_telemetry=1)
+
+    rest = _round6_scaled_tet(1.0)
+    tet_indices = np.asarray([[0, 1, 2, 3]], dtype=np.int32)
+    tet_poses = _round6_tet_poses(rest, tet_indices)
+    current = rest.copy()
+    current[3, 2] = 5.0e-5
+    displacement = np.asarray([[0.0, 0.0, 1.0e-4]], dtype=np.float32)
+
+    legacy = _round7_guard_fixture(
+        device,
+        current,
+        np.zeros_like(displacement),
+        displacement,
+        tet_indices,
+        tet_poses,
+        particle_ids=(3,),
+        policy_code=0,
+    )[0]
+    recovery = _round7_guard_fixture(
+        device,
+        current,
+        np.zeros_like(displacement),
+        displacement,
+        tet_indices,
+        tet_poses,
+        particle_ids=(3,),
+        policy_code=1,
+    )[0]
+    test.assertTrue(np.array_equal(legacy, np.zeros(3, dtype=np.float32)))
+    test.assertTrue(np.array_equal(recovery, displacement[0]))
+    decreasing = _round7_guard_fixture(
+        device,
+        current,
+        np.zeros_like(displacement),
+        -displacement,
+        tet_indices,
+        tet_poses,
+        particle_ids=(3,),
+        policy_code=1,
+    )[0]
+    test.assertTrue(np.array_equal(decreasing, np.zeros(3, dtype=np.float32)))
+
+    nonpositive = current.copy()
+    nonpositive[3, 2] = 0.0
+    rejected_nonpositive = _round7_guard_fixture(
+        device,
+        nonpositive,
+        np.zeros_like(displacement),
+        displacement,
+        tet_indices,
+        tet_poses,
+        particle_ids=(3,),
+        policy_code=1,
+    )[0]
+    test.assertTrue(np.array_equal(rejected_nonpositive, np.zeros(3, dtype=np.float32)))
+    nonfinite = current.copy()
+    nonfinite[3, 2] = np.nan
+    rejected_nonfinite = _round7_guard_fixture(
+        device,
+        nonfinite,
+        np.zeros_like(displacement),
+        displacement,
+        tet_indices,
+        tet_poses,
+        particle_ids=(3,),
+        policy_code=1,
+    )[0]
+    test.assertTrue(np.array_equal(rejected_nonfinite, np.zeros(3, dtype=np.float32)))
+
+    model = _round6_solver_model(device)
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=1,
+        particle_positive_j_guard_policy="recovery",
+        particle_positive_j_guard_telemetry=True,
+        particle_enable_tile_solve=False,
+        particle_collision_detection_interval=-1,
+    )
+    state = model.state()
+    state.particle_q.assign(current.astype(np.float32))
+    solver.particle_displacements.assign(np.pad(displacement, ((0, 3), (0, 0))))
+    solver._reset_positive_j_guard_telemetry()
+    solver._apply_guarded_particle_displacements(state.particle_q)
+    telemetry = solver.read_positive_j_guard_telemetry()
+    test.assertEqual(telemetry["schema"], "newton-vbd-positive-j-guard-telemetry-v1")
+    test.assertEqual(telemetry["policy"], "recovery")
+    witnesses = [record for record in telemetry["records"] if record["reason"] == "recovery_nonworsening"]
+    test.assertEqual(len(witnesses), 1)
+    test.assertTrue(witnesses[0]["decision"])
+    test.assertGreater(witnesses[0]["nonlegacy_alpha"], 0.0)
+
+    path_model = _round6_solver_model(device)
+    path_solver = newton.solvers.SolverVBD(
+        path_model,
+        iterations=1,
+        particle_positive_j_guard_policy="recovery",
+        particle_positive_j_guard_telemetry=True,
+        particle_enable_tile_solve=device.is_cuda,
+        particle_collision_detection_interval=-1,
+    )
+    path_in, path_out = path_model.state(), path_model.state()
+    path_q = path_model.particle_q.numpy().copy()
+    path_q[3, 2] = 5.0e-5
+    path_in.particle_q.assign(path_q.astype(np.float32))
+    path_in.particle_qd.zero_()
+    path_solver.step(path_in, path_out, path_model.control(clone_variables=False), None, 0.01)
+    path_telemetry = path_solver.read_positive_j_guard_telemetry()
+    path_sites = {record["site"] for record in path_telemetry["records"]}
+    test.assertIn("initializer", path_sites)
+    test.assertIn("tile" if device.is_cuda else "scalar", path_sites)
 
 
 def _round6_solver_model(device):
@@ -4246,6 +4430,13 @@ add_function_test(
     TestSolverVBD,
     "test_vbd_positive_j_invalid_inputs",
     _test_vbd_positive_j_invalid_inputs,
+    devices=devices,
+)
+
+add_function_test(
+    TestSolverVBD,
+    "test_vbd_positive_j_recovery_policy_and_telemetry",
+    _test_vbd_positive_j_recovery_policy_and_telemetry,
     devices=devices,
 )
 

@@ -32,6 +32,11 @@ from ..xpbd.kernels import apply_joint_forces
 from . import particle_vbd_kernels, rigid_vbd_kernels, vbd_coupling_kernels
 from .particle_vbd_kernels import (
     NUM_THREADS_PER_COLLISION_PRIMITIVE,
+    POSITIVE_J_GUARD_EVENT_ORDINAL_MAX,
+    POSITIVE_J_GUARD_REASON_COUNT,
+    POSITIVE_J_GUARD_SITE_INITIALIZER,
+    POSITIVE_J_GUARD_SITE_SCALAR,
+    POSITIVE_J_GUARD_SITE_TILE,
     TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
     # Topological filtering helper functions
     accumulate_particle_body_contact_force_and_hessian,
@@ -44,6 +49,7 @@ from .particle_vbd_kernels import (
     # Solver kernels (particle VBD)
     forward_step,
     reset_particle_state,
+    reset_positive_j_guard_telemetry,
     solve_elasticity,
     solve_elasticity_tile,
     update_velocity,
@@ -291,6 +297,8 @@ class SolverVBD(SolverBase, CouplingInterface):
         particle_rest_shape_contact_exclusion_radius: float = 0.0,
         particle_external_vertex_contact_filtering_map: dict | None = None,
         particle_external_edge_contact_filtering_map: dict | None = None,
+        particle_positive_j_guard_policy: str = "legacy",
+        particle_positive_j_guard_telemetry: bool = False,
         # Rigid body - constraint formulation and stabilization
         rigid_compliant_alm: bool | None = None,  # None retains legacy and emits the scoped migration warning
         rigid_avbd_alpha: float | None = None,  # Shared alpha override; None uses mode defaults
@@ -508,6 +516,15 @@ class SolverVBD(SolverBase, CouplingInterface):
               enabled only when positive Dahl parameters are authored.
 
         """
+        if not isinstance(particle_positive_j_guard_policy, str):
+            raise TypeError("particle_positive_j_guard_policy must be a string")
+        if particle_positive_j_guard_policy not in {"legacy", "recovery"}:
+            raise ValueError(
+                "particle_positive_j_guard_policy must be one of {'legacy', 'recovery'}"
+            )
+        if type(particle_positive_j_guard_telemetry) is not bool:
+            raise TypeError("particle_positive_j_guard_telemetry must be a bool")
+
         integrates_rigid_bodies = model.body_count > 0 and not integrate_with_external_rigid_solver
 
         # TODO: Complete the Newton 1.6 deprecation by defaulting omitted
@@ -594,6 +611,9 @@ class SolverVBD(SolverBase, CouplingInterface):
         # Common parameters
         self.iterations = iterations
         self.friction_epsilon = friction_epsilon
+        self.particle_positive_j_guard_policy = particle_positive_j_guard_policy
+        self.particle_positive_j_guard_policy_code = int(particle_positive_j_guard_policy == "recovery")
+        self.particle_positive_j_guard_telemetry = particle_positive_j_guard_telemetry
         self._joint_mode_deprecation_warned = False
 
         # Rigid integration mode: when True, rigid bodies are integrated by an external
@@ -666,6 +686,43 @@ class SolverVBD(SolverBase, CouplingInterface):
         particle_external_edge_contact_filtering_map: dict | None,
     ):
         """Initialize particle-specific data structures and settings."""
+        self._positive_j_guard_reason_names = (
+            "invalid_input",
+            "legacy_floor_lock",
+            "recovery_decrease",
+            "fraction_to_boundary",
+            "recovery_nonworsening",
+        )
+        self._positive_j_guard_site_names = {
+            0: "initializer",
+            1: "tile",
+            2: "scalar",
+        }
+        self._positive_j_guard_enabled = bool(
+            self.particle_positive_j_guard_telemetry and model.tet_count > 0
+        )
+        telemetry_slots = model.tet_count * POSITIVE_J_GUARD_REASON_COUNT if self._positive_j_guard_enabled else 0
+        self._positive_j_guard_event_ordinal = wp.full(
+            telemetry_slots,
+            POSITIVE_J_GUARD_EVENT_ORDINAL_MAX,
+            dtype=wp.int32,
+            device=self.device,
+        )
+        self._positive_j_guard_event_site = wp.zeros(telemetry_slots, dtype=wp.int32, device=self.device)
+        self._positive_j_guard_event_particle_id = wp.zeros(telemetry_slots, dtype=wp.int32, device=self.device)
+        self._positive_j_guard_event_tet_id = wp.zeros(telemetry_slots, dtype=wp.int32, device=self.device)
+        self._positive_j_guard_event_current_determinant = wp.zeros(telemetry_slots, dtype=float, device=self.device)
+        self._positive_j_guard_event_floor = wp.zeros(telemetry_slots, dtype=float, device=self.device)
+        self._positive_j_guard_event_proposed_determinant = wp.zeros(telemetry_slots, dtype=float, device=self.device)
+        self._positive_j_guard_event_alpha = wp.zeros(telemetry_slots, dtype=float, device=self.device)
+        self._positive_j_guard_event_decision = wp.zeros(telemetry_slots, dtype=wp.int32, device=self.device)
+        self._positive_j_guard_event_nonlegacy_alpha = wp.zeros(telemetry_slots, dtype=float, device=self.device)
+        self._positive_j_guard_reason_counts = wp.zeros(
+            POSITIVE_J_GUARD_REASON_COUNT if self._positive_j_guard_enabled else 0,
+            dtype=wp.int32,
+            device=self.device,
+        )
+
         # Early exit if no particles
         if model.particle_count == 0:
             return
@@ -738,6 +795,82 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.pos_prev_collision_detection = wp.zeros_like(model.particle_q, device=self.device)
         self.particle_displacements = wp.zeros(self.model.particle_count, dtype=wp.vec3, device=self.device)
         self.truncation_ts = wp.zeros(self.model.particle_count, dtype=float, device=self.device)
+
+    def read_positive_j_guard_telemetry(self):
+        """Return the current narrow positive-J guard telemetry as JSON-safe data."""
+        if not self._positive_j_guard_enabled:
+            return None
+
+        ordinals = self._to_numpy(self._positive_j_guard_event_ordinal, dtype=np.int64)
+        sites = self._to_numpy(self._positive_j_guard_event_site, dtype=np.int32)
+        particle_ids = self._to_numpy(self._positive_j_guard_event_particle_id, dtype=np.int32)
+        tet_ids = self._to_numpy(self._positive_j_guard_event_tet_id, dtype=np.int32)
+        current = self._to_numpy(self._positive_j_guard_event_current_determinant, dtype=float)
+        floors = self._to_numpy(self._positive_j_guard_event_floor, dtype=float)
+        proposed = self._to_numpy(self._positive_j_guard_event_proposed_determinant, dtype=float)
+        alphas = self._to_numpy(self._positive_j_guard_event_alpha, dtype=float)
+        decisions = self._to_numpy(self._positive_j_guard_event_decision, dtype=np.int32)
+        nonlegacy_alphas = self._to_numpy(self._positive_j_guard_event_nonlegacy_alpha, dtype=float)
+        reason_counts = self._to_numpy(self._positive_j_guard_reason_counts, dtype=np.int64)
+
+        def json_float(value):
+            value = float(value)
+            return value if np.isfinite(value) else None
+
+        records = []
+        for slot, ordinal in enumerate(ordinals):
+            if int(ordinal) == POSITIVE_J_GUARD_EVENT_ORDINAL_MAX:
+                continue
+            reason_index = slot % POSITIVE_J_GUARD_REASON_COUNT
+            records.append(
+                {
+                    "event_ordinal": int(ordinal),
+                    "site": self._positive_j_guard_site_names.get(int(sites[slot]), "unknown"),
+                    "particle_id": int(particle_ids[slot]),
+                    "tet_id": int(tet_ids[slot]),
+                    "reason": self._positive_j_guard_reason_names[reason_index],
+                    "current_determinant_m3": json_float(current[slot]),
+                    "determinant_floor_m3": json_float(floors[slot]),
+                    "proposed_determinant_m3": json_float(proposed[slot]),
+                    "alpha": json_float(alphas[slot]),
+                    "decision": bool(decisions[slot]),
+                    "nonlegacy_alpha": json_float(nonlegacy_alphas[slot]),
+                }
+            )
+        records.sort(key=lambda record: (record["tet_id"], record["reason"], record["event_ordinal"]))
+        return {
+            "schema": "newton-vbd-positive-j-guard-telemetry-v1",
+            "policy": self.particle_positive_j_guard_policy,
+            "telemetry_enabled": True,
+            "reason_counts": {
+                reason: int(reason_counts[index])
+                for index, reason in enumerate(self._positive_j_guard_reason_names)
+            },
+            "record_count": len(records),
+            "records": records,
+        }
+
+    def _reset_positive_j_guard_telemetry(self):
+        if not self._positive_j_guard_enabled:
+            return
+        wp.launch(
+            kernel=reset_positive_j_guard_telemetry,
+            dim=self._positive_j_guard_event_ordinal.shape[0],
+            inputs=[
+                self._positive_j_guard_event_ordinal,
+                self._positive_j_guard_event_site,
+                self._positive_j_guard_event_particle_id,
+                self._positive_j_guard_event_tet_id,
+                self._positive_j_guard_event_current_determinant,
+                self._positive_j_guard_event_floor,
+                self._positive_j_guard_event_proposed_determinant,
+                self._positive_j_guard_event_alpha,
+                self._positive_j_guard_event_decision,
+                self._positive_j_guard_event_nonlegacy_alpha,
+                self._positive_j_guard_reason_counts,
+            ],
+            device=self.device,
+        )
 
     @staticmethod
     def _validate_particle_coloring(model: Model) -> None:
@@ -2098,6 +2231,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 need to be allocated or grown during graph capture.
         """
         self._apply_module_options()
+        self._reset_positive_j_guard_telemetry()
         update_rigid = self._update_rigid_history
         self._update_rigid_history = True
 
@@ -2403,7 +2537,7 @@ class SolverVBD(SolverBase, CouplingInterface):
 
     def _apply_guarded_particle_displacements(self, particle_q):
         """Apply the initialized candidate one existing particle color at a time."""
-        for color_group in self.model.particle_color_groups:
+        for color, color_group in enumerate(self.model.particle_color_groups):
             wp.launch(
                 kernel=apply_guarded_particle_displacements,
                 dim=color_group.size,
@@ -2413,6 +2547,22 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.model.tet_indices,
                     self.model.tet_poses,
                     self.particle_adjacency,
+                    self.particle_positive_j_guard_policy_code,
+                    self._positive_j_guard_enabled,
+                    color,
+                    self.model.particle_count,
+                    POSITIVE_J_GUARD_SITE_INITIALIZER,
+                    self._positive_j_guard_event_ordinal,
+                    self._positive_j_guard_event_site,
+                    self._positive_j_guard_event_particle_id,
+                    self._positive_j_guard_event_tet_id,
+                    self._positive_j_guard_event_current_determinant,
+                    self._positive_j_guard_event_floor,
+                    self._positive_j_guard_event_proposed_determinant,
+                    self._positive_j_guard_event_alpha,
+                    self._positive_j_guard_event_decision,
+                    self._positive_j_guard_event_nonlegacy_alpha,
+                    self._positive_j_guard_reason_counts,
                 ],
                 outputs=[self.particle_displacements],
                 device=self.device,
@@ -3046,6 +3196,24 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self.particle_adjacency,
                         self.particle_forces,
                         self.particle_hessians,
+                        self.particle_positive_j_guard_policy_code,
+                        self._positive_j_guard_enabled,
+                        len(self.model.particle_color_groups)
+                        + iter_num * len(self.model.particle_color_groups)
+                        + color,
+                        self.model.particle_count,
+                        POSITIVE_J_GUARD_SITE_TILE,
+                        self._positive_j_guard_event_ordinal,
+                        self._positive_j_guard_event_site,
+                        self._positive_j_guard_event_particle_id,
+                        self._positive_j_guard_event_tet_id,
+                        self._positive_j_guard_event_current_determinant,
+                        self._positive_j_guard_event_floor,
+                        self._positive_j_guard_event_proposed_determinant,
+                        self._positive_j_guard_event_alpha,
+                        self._positive_j_guard_event_decision,
+                        self._positive_j_guard_event_nonlegacy_alpha,
+                        self._positive_j_guard_reason_counts,
                     ],
                     outputs=[
                         self.particle_displacements,
@@ -3078,6 +3246,24 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self.particle_adjacency,
                         self.particle_forces,
                         self.particle_hessians,
+                        self.particle_positive_j_guard_policy_code,
+                        self._positive_j_guard_enabled,
+                        len(self.model.particle_color_groups)
+                        + iter_num * len(self.model.particle_color_groups)
+                        + color,
+                        self.model.particle_count,
+                        POSITIVE_J_GUARD_SITE_SCALAR,
+                        self._positive_j_guard_event_ordinal,
+                        self._positive_j_guard_event_site,
+                        self._positive_j_guard_event_particle_id,
+                        self._positive_j_guard_event_tet_id,
+                        self._positive_j_guard_event_current_determinant,
+                        self._positive_j_guard_event_floor,
+                        self._positive_j_guard_event_proposed_determinant,
+                        self._positive_j_guard_event_alpha,
+                        self._positive_j_guard_event_decision,
+                        self._positive_j_guard_event_nonlegacy_alpha,
+                        self._positive_j_guard_reason_counts,
                     ],
                     outputs=[
                         self.particle_displacements,
