@@ -720,12 +720,19 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._positive_j_guard_enabled = bool(
             self.particle_positive_j_guard_telemetry and model.tet_count > 0
         )
+        self._positive_j_guard_step_epoch = 0
         telemetry_slots = model.tet_count * POSITIVE_J_GUARD_REASON_COUNT if self._positive_j_guard_enabled else 0
         self._positive_j_guard_event_ordinal = wp.full(
             telemetry_slots,
             POSITIVE_J_GUARD_EVENT_ORDINAL_MAX,
             dtype=wp.int32,
             device=self.device,
+        )
+        self._positive_j_guard_event_solver_step_epoch = wp.zeros(
+            telemetry_slots, dtype=wp.int32, device=self.device
+        )
+        self._positive_j_guard_event_pass_ordinal = wp.zeros(
+            telemetry_slots, dtype=wp.int32, device=self.device
         )
         self._positive_j_guard_event_site = wp.zeros(telemetry_slots, dtype=wp.int32, device=self.device)
         self._positive_j_guard_event_particle_id = wp.zeros(telemetry_slots, dtype=wp.int32, device=self.device)
@@ -736,6 +743,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._positive_j_guard_event_alpha = wp.zeros(telemetry_slots, dtype=float, device=self.device)
         self._positive_j_guard_event_decision = wp.zeros(telemetry_slots, dtype=wp.int32, device=self.device)
         self._positive_j_guard_event_nonlegacy_alpha = wp.zeros(telemetry_slots, dtype=float, device=self.device)
+        self._positive_j_guard_event_applied_determinant = wp.zeros(telemetry_slots, dtype=float, device=self.device)
         self._positive_j_guard_reason_counts = wp.zeros(
             POSITIVE_J_GUARD_REASON_COUNT if self._positive_j_guard_enabled else 0,
             dtype=wp.int32,
@@ -867,6 +875,165 @@ class SolverVBD(SolverBase, CouplingInterface):
             "records": records,
         }
 
+    def read_positive_j_guard_telemetry_v2(self):
+        """Return scope-explicit positive-J guard telemetry for the current step."""
+        if not self._positive_j_guard_enabled:
+            return None
+
+        step_epoch = self._positive_j_guard_step_epoch
+        if type(step_epoch) is not int or not 0 <= step_epoch <= POSITIVE_J_GUARD_EVENT_ORDINAL_MAX:
+            raise RuntimeError("positive-J guard telemetry step epoch is malformed")
+        particle_count = int(self.model.particle_count)
+        tet_count = int(self.model.tet_count)
+        color_group_count = len(self.model.particle_color_groups)
+        iterations = int(self.iterations)
+        if particle_count <= 0 or tet_count <= 0 or color_group_count <= 0 or iterations < 0:
+            raise RuntimeError("positive-J guard telemetry metadata is malformed")
+        expected_slots = tet_count * POSITIVE_J_GUARD_REASON_COUNT
+
+        arrays = {
+            "event_ordinal": self._positive_j_guard_event_ordinal,
+            "event_solver_step_epoch": self._positive_j_guard_event_solver_step_epoch,
+            "event_pass_ordinal": self._positive_j_guard_event_pass_ordinal,
+            "event_site": self._positive_j_guard_event_site,
+            "event_particle_id": self._positive_j_guard_event_particle_id,
+            "event_tet_id": self._positive_j_guard_event_tet_id,
+            "event_current_determinant": self._positive_j_guard_event_current_determinant,
+            "event_floor": self._positive_j_guard_event_floor,
+            "event_proposed_determinant": self._positive_j_guard_event_proposed_determinant,
+            "event_alpha": self._positive_j_guard_event_alpha,
+            "event_decision": self._positive_j_guard_event_decision,
+            "event_nonlegacy_alpha": self._positive_j_guard_event_nonlegacy_alpha,
+            "event_applied_determinant": self._positive_j_guard_event_applied_determinant,
+        }
+        for name, array in arrays.items():
+            if array is None or not hasattr(array, "shape") or tuple(array.shape) != (expected_slots,):
+                raise RuntimeError(f"positive-J guard telemetry {name} buffer shape differs")
+        reason_counts_array = self._positive_j_guard_reason_counts
+        if reason_counts_array is None or not hasattr(reason_counts_array, "shape") or tuple(reason_counts_array.shape) != (POSITIVE_J_GUARD_REASON_COUNT,):
+            raise RuntimeError("positive-J guard telemetry reason counter shape differs")
+
+        ordinals = self._to_numpy(arrays["event_ordinal"], dtype=np.int64).reshape(-1)
+        epochs = self._to_numpy(arrays["event_solver_step_epoch"], dtype=np.int64).reshape(-1)
+        pass_ordinals = self._to_numpy(arrays["event_pass_ordinal"], dtype=np.int64).reshape(-1)
+        sites = self._to_numpy(arrays["event_site"], dtype=np.int64).reshape(-1)
+        particle_ids = self._to_numpy(arrays["event_particle_id"], dtype=np.int64).reshape(-1)
+        tet_ids = self._to_numpy(arrays["event_tet_id"], dtype=np.int64).reshape(-1)
+        current = self._to_numpy(arrays["event_current_determinant"], dtype=float).reshape(-1)
+        floors = self._to_numpy(arrays["event_floor"], dtype=float).reshape(-1)
+        proposed = self._to_numpy(arrays["event_proposed_determinant"], dtype=float).reshape(-1)
+        alphas = self._to_numpy(arrays["event_alpha"], dtype=float).reshape(-1)
+        decisions = self._to_numpy(arrays["event_decision"], dtype=np.int64).reshape(-1)
+        nonlegacy_alphas = self._to_numpy(arrays["event_nonlegacy_alpha"], dtype=float).reshape(-1)
+        applied = self._to_numpy(arrays["event_applied_determinant"], dtype=float).reshape(-1)
+        reason_counts = self._to_numpy(reason_counts_array, dtype=np.int64).reshape(-1)
+        if any(
+            values.shape != (expected_slots,)
+            for values in (
+                ordinals,
+                epochs,
+                pass_ordinals,
+                sites,
+                particle_ids,
+                tet_ids,
+                current,
+                floors,
+                proposed,
+                alphas,
+                decisions,
+                nonlegacy_alphas,
+                applied,
+            )
+        ):
+            raise RuntimeError("positive-J guard telemetry readback buffer length differs")
+        if reason_counts.shape != (POSITIVE_J_GUARD_REASON_COUNT,):
+            raise RuntimeError("positive-J guard telemetry reason counter length differs")
+
+        def json_float(value):
+            value = float(value)
+            return value if np.isfinite(value) else None
+
+        records = []
+        for slot, ordinal_value in enumerate(ordinals):
+            ordinal = int(ordinal_value)
+            if ordinal == POSITIVE_J_GUARD_EVENT_ORDINAL_MAX:
+                if any(
+                    value != expected
+                    for value, expected in (
+                        (int(epochs[slot]), -1),
+                        (int(pass_ordinals[slot]), -1),
+                        (int(sites[slot]), -1),
+                        (int(particle_ids[slot]), -1),
+                        (int(tet_ids[slot]), -1),
+                        (int(decisions[slot]), 0),
+                    )
+                ) or any(
+                    not np.isfinite(float(values[slot])) or float(values[slot]) != 0.0
+                    for values in (current, floors, proposed, alphas, nonlegacy_alphas, applied)
+                ):
+                    raise RuntimeError("positive-J guard telemetry sentinel slot is malformed")
+                continue
+            if ordinal < 0 or ordinal >= POSITIVE_J_GUARD_EVENT_ORDINAL_MAX:
+                raise RuntimeError("positive-J guard telemetry event ordinal is malformed")
+            epoch = int(epochs[slot])
+            pass_ordinal = int(pass_ordinals[slot])
+            site = int(sites[slot])
+            particle_id = int(particle_ids[slot])
+            tet_id = int(tet_ids[slot])
+            decision = int(decisions[slot])
+            if epoch != step_epoch or pass_ordinal < 0 or site not in self._positive_j_guard_site_names or not 0 <= particle_id < particle_count or not 0 <= tet_id < tet_count or decision not in (0, 1):
+                raise RuntimeError("positive-J guard telemetry winning slot is malformed")
+            expected_ordinal = pass_ordinal * particle_count + particle_id
+            if expected_ordinal != ordinal or expected_ordinal < 0 or expected_ordinal >= POSITIVE_J_GUARD_EVENT_ORDINAL_MAX:
+                raise RuntimeError("positive-J guard telemetry event ordinal mapping differs")
+            reason_index = slot % POSITIVE_J_GUARD_REASON_COUNT
+            records.append(
+                {
+                    "solver_step_epoch": epoch,
+                    "pass_ordinal": pass_ordinal,
+                    "event_ordinal": ordinal,
+                    "site": self._positive_j_guard_site_names[site],
+                    "particle_id": particle_id,
+                    "tet_id": tet_id,
+                    "local_reason": self._positive_j_guard_reason_names[reason_index],
+                    "local_current_determinant_m3": json_float(current[slot]),
+                    "local_determinant_floor_m3": json_float(floors[slot]),
+                    "local_unscaled_proposed_determinant_m3": json_float(proposed[slot]),
+                    "aggregate_alpha": json_float(alphas[slot]),
+                    "aggregate_decision": bool(decision),
+                    "aggregate_nonlegacy_alpha": json_float(nonlegacy_alphas[slot]),
+                    "applied_determinant_m3": json_float(applied[slot]),
+                }
+            )
+        if any(int(value) < 0 for value in reason_counts):
+            raise RuntimeError("positive-J guard telemetry reason counters are malformed")
+        records.sort(key=lambda record: (record["tet_id"], record["local_reason"], record["event_ordinal"]))
+        representatives = {reason: 0 for reason in self._positive_j_guard_reason_names}
+        for record in records:
+            representatives[record["local_reason"]] += 1
+        if any(int(reason_counts[index]) < representatives[reason] for index, reason in enumerate(self._positive_j_guard_reason_names)):
+            raise RuntimeError("positive-J guard telemetry counters under-report representatives")
+        return {
+            "schema": "newton-vbd-positive-j-guard-telemetry-v2",
+            "policy": self.particle_positive_j_guard_policy,
+            "telemetry_enabled": True,
+            "solver_step_epoch": step_epoch,
+            "particle_count": particle_count,
+            "particle_color_group_count": color_group_count,
+            "iterations": iterations,
+            "field_scopes": {
+                "local": "one_incident_tet_unscaled_candidate",
+                "aggregate": "one_particle_final_guard_decision",
+                "applied": "same_incident_tet_after_aggregate_alpha",
+            },
+            "reason_counts": {
+                reason: int(reason_counts[index])
+                for index, reason in enumerate(self._positive_j_guard_reason_names)
+            },
+            "record_count": len(records),
+            "records": records,
+        }
+
     def read_particle_sweep_telemetry(self):
         """Return passive complete-sweep particle update telemetry for the last step."""
         if not self.particle_sweep_telemetry:
@@ -938,6 +1105,8 @@ class SolverVBD(SolverBase, CouplingInterface):
             dim=self._positive_j_guard_event_ordinal.shape[0],
             inputs=[
                 self._positive_j_guard_event_ordinal,
+                self._positive_j_guard_event_solver_step_epoch,
+                self._positive_j_guard_event_pass_ordinal,
                 self._positive_j_guard_event_site,
                 self._positive_j_guard_event_particle_id,
                 self._positive_j_guard_event_tet_id,
@@ -947,10 +1116,20 @@ class SolverVBD(SolverBase, CouplingInterface):
                 self._positive_j_guard_event_alpha,
                 self._positive_j_guard_event_decision,
                 self._positive_j_guard_event_nonlegacy_alpha,
+                self._positive_j_guard_event_applied_determinant,
                 self._positive_j_guard_reason_counts,
             ],
             device=self.device,
         )
+
+    def _advance_positive_j_guard_step_epoch(self):
+        if not self._positive_j_guard_enabled:
+            return
+        if type(self._positive_j_guard_step_epoch) is not int:
+            raise RuntimeError("positive-J guard telemetry step epoch is malformed")
+        if self._positive_j_guard_step_epoch >= POSITIVE_J_GUARD_EVENT_ORDINAL_MAX:
+            raise OverflowError("positive-J guard telemetry step epoch exceeded int32 range")
+        self._positive_j_guard_step_epoch += 1
 
     @staticmethod
     def _validate_particle_coloring(model: Model) -> None:
@@ -2311,6 +2490,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 need to be allocated or grown during graph capture.
         """
         self._apply_module_options()
+        self._advance_positive_j_guard_step_epoch()
         self._reset_particle_sweep_telemetry()
         self._reset_positive_j_guard_telemetry()
         update_rigid = self._update_rigid_history
@@ -2650,10 +2830,13 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self.particle_adjacency,
                     self.particle_positive_j_guard_policy_code,
                     self._positive_j_guard_enabled,
+                    self._positive_j_guard_step_epoch,
                     color,
                     self.model.particle_count,
                     POSITIVE_J_GUARD_SITE_INITIALIZER,
                     self._positive_j_guard_event_ordinal,
+                    self._positive_j_guard_event_solver_step_epoch,
+                    self._positive_j_guard_event_pass_ordinal,
                     self._positive_j_guard_event_site,
                     self._positive_j_guard_event_particle_id,
                     self._positive_j_guard_event_tet_id,
@@ -2663,6 +2846,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self._positive_j_guard_event_alpha,
                     self._positive_j_guard_event_decision,
                     self._positive_j_guard_event_nonlegacy_alpha,
+                    self._positive_j_guard_event_applied_determinant,
                     self._positive_j_guard_reason_counts,
                 ],
                 outputs=[self.particle_displacements],
@@ -3299,12 +3483,15 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self.particle_hessians,
                         self.particle_positive_j_guard_policy_code,
                         self._positive_j_guard_enabled,
+                        self._positive_j_guard_step_epoch,
                         len(self.model.particle_color_groups)
                         + iter_num * len(self.model.particle_color_groups)
                         + color,
                         self.model.particle_count,
                         POSITIVE_J_GUARD_SITE_TILE,
                         self._positive_j_guard_event_ordinal,
+                        self._positive_j_guard_event_solver_step_epoch,
+                        self._positive_j_guard_event_pass_ordinal,
                         self._positive_j_guard_event_site,
                         self._positive_j_guard_event_particle_id,
                         self._positive_j_guard_event_tet_id,
@@ -3314,6 +3501,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self._positive_j_guard_event_alpha,
                         self._positive_j_guard_event_decision,
                         self._positive_j_guard_event_nonlegacy_alpha,
+                        self._positive_j_guard_event_applied_determinant,
                         self._positive_j_guard_reason_counts,
                     ],
                     outputs=[
@@ -3349,12 +3537,15 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self.particle_hessians,
                         self.particle_positive_j_guard_policy_code,
                         self._positive_j_guard_enabled,
+                        self._positive_j_guard_step_epoch,
                         len(self.model.particle_color_groups)
                         + iter_num * len(self.model.particle_color_groups)
                         + color,
                         self.model.particle_count,
                         POSITIVE_J_GUARD_SITE_SCALAR,
                         self._positive_j_guard_event_ordinal,
+                        self._positive_j_guard_event_solver_step_epoch,
+                        self._positive_j_guard_event_pass_ordinal,
                         self._positive_j_guard_event_site,
                         self._positive_j_guard_event_particle_id,
                         self._positive_j_guard_event_tet_id,
@@ -3364,6 +3555,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self._positive_j_guard_event_alpha,
                         self._positive_j_guard_event_decision,
                         self._positive_j_guard_event_nonlegacy_alpha,
+                        self._positive_j_guard_event_applied_determinant,
                         self._positive_j_guard_reason_counts,
                     ],
                     outputs=[

@@ -3773,10 +3773,13 @@ def _round7_guard_fixture_kernel(
     particle_adjacency: MeshAdjacencyData,
     policy_code: int,
     telemetry_enabled: bool,
+    solver_step_epoch: int,
     pass_ordinal: int,
     particle_count: int,
     site: int,
     event_ordinal: wp.array[wp.int32],
+    event_solver_step_epoch: wp.array[wp.int32],
+    event_pass_ordinal: wp.array[wp.int32],
     event_site: wp.array[wp.int32],
     event_particle_id: wp.array[wp.int32],
     event_tet_id: wp.array[wp.int32],
@@ -3786,6 +3789,7 @@ def _round7_guard_fixture_kernel(
     event_alpha: wp.array[float],
     event_decision: wp.array[wp.int32],
     event_nonlegacy_alpha: wp.array[float],
+    event_applied_determinant: wp.array[float],
     reason_counts: wp.array[wp.int32],
     guarded_displacements: wp.array[wp.vec3],
 ):
@@ -3801,10 +3805,13 @@ def _round7_guard_fixture_kernel(
         particle_adjacency,
         policy_code,
         telemetry_enabled,
+        solver_step_epoch,
         pass_ordinal,
         particle_count,
         site,
         event_ordinal,
+        event_solver_step_epoch,
+        event_pass_ordinal,
         event_site,
         event_particle_id,
         event_tet_id,
@@ -3814,6 +3821,7 @@ def _round7_guard_fixture_kernel(
         event_alpha,
         event_decision,
         event_nonlegacy_alpha,
+        event_applied_determinant,
         reason_counts,
     )
 
@@ -3843,6 +3851,8 @@ def _round7_guard_fixture(
     adjacency.init_vertex_adjacency(pos.shape[0])
     adjacency_device = adjacency.to(device)
     event_ordinal = wp.empty(0, dtype=wp.int32, device=device)
+    event_solver_step_epoch = wp.empty(0, dtype=wp.int32, device=device)
+    event_pass_ordinal = wp.empty(0, dtype=wp.int32, device=device)
     event_site = wp.empty(0, dtype=wp.int32, device=device)
     event_particle_id = wp.empty(0, dtype=wp.int32, device=device)
     event_tet_id = wp.empty(0, dtype=wp.int32, device=device)
@@ -3852,6 +3862,7 @@ def _round7_guard_fixture(
     event_alpha = wp.empty(0, dtype=float, device=device)
     event_decision = wp.empty(0, dtype=wp.int32, device=device)
     event_nonlegacy_alpha = wp.empty(0, dtype=float, device=device)
+    event_applied_determinant = wp.empty(0, dtype=float, device=device)
     reason_counts = wp.empty(0, dtype=wp.int32, device=device)
     outputs = wp.empty(particle_ids.shape[0], dtype=wp.vec3, device=device)
     wp.launch(
@@ -3868,9 +3879,12 @@ def _round7_guard_fixture(
             policy_code,
             False,
             0,
+            0,
             pos.shape[0],
             2,
             event_ordinal,
+            event_solver_step_epoch,
+            event_pass_ordinal,
             event_site,
             event_particle_id,
             event_tet_id,
@@ -3880,6 +3894,7 @@ def _round7_guard_fixture(
             event_alpha,
             event_decision,
             event_nonlegacy_alpha,
+            event_applied_determinant,
             reason_counts,
         ],
         outputs=[outputs],
@@ -3919,10 +3934,13 @@ def _round7_guard_telemetry(device, policy, current, displacement):
             solver.particle_adjacency,
             solver.particle_positive_j_guard_policy_code,
             solver._positive_j_guard_enabled,
+            solver._positive_j_guard_step_epoch,
             0,
             int(model.particle_count),
             0,
             solver._positive_j_guard_event_ordinal,
+            solver._positive_j_guard_event_solver_step_epoch,
+            solver._positive_j_guard_event_pass_ordinal,
             solver._positive_j_guard_event_site,
             solver._positive_j_guard_event_particle_id,
             solver._positive_j_guard_event_tet_id,
@@ -3932,6 +3950,7 @@ def _round7_guard_telemetry(device, policy, current, displacement):
             solver._positive_j_guard_event_alpha,
             solver._positive_j_guard_event_decision,
             solver._positive_j_guard_event_nonlegacy_alpha,
+            solver._positive_j_guard_event_applied_determinant,
             solver._positive_j_guard_reason_counts,
         ],
         outputs=[guarded],
@@ -4244,6 +4263,132 @@ def _test_vbd_positive_j_recovery_policy_and_telemetry(test, device):
     path_sites = {record["site"] for record in path_telemetry["records"]}
     test.assertIn("initializer", path_sites)
     test.assertIn("tile" if device.is_cuda else "scalar", path_sites)
+
+
+def _test_vbd_positive_j_scope_explicit_telemetry_v2(test, device):
+    """Expose exact local, aggregate, and applied scopes with checked epochs."""
+    disabled_model = _round6_solver_model(device)
+    disabled = newton.solvers.SolverVBD(disabled_model, iterations=1)
+    test.assertIsNone(disabled.read_positive_j_guard_telemetry_v2())
+
+    model = _round6_solver_model(device)
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=1,
+        particle_positive_j_guard_policy="recovery",
+        particle_positive_j_guard_telemetry=True,
+        particle_enable_tile_solve=False,
+        particle_collision_detection_interval=-1,
+    )
+    state_in, state_out = model.state(), model.state()
+    current = model.particle_q.numpy().copy()
+    current[3, 2] = 5.0e-5
+    state_in.particle_q.assign(current.astype(np.float32))
+    state_in.particle_qd.zero_()
+    solver.step(state_in, state_out, model.control(clone_variables=False), None, 0.01)
+    payload = solver.read_positive_j_guard_telemetry_v2()
+    test.assertEqual(
+        set(payload),
+        {
+            "schema",
+            "policy",
+            "telemetry_enabled",
+            "solver_step_epoch",
+            "particle_count",
+            "particle_color_group_count",
+            "iterations",
+            "field_scopes",
+            "reason_counts",
+            "record_count",
+            "records",
+        },
+    )
+    test.assertEqual(payload["schema"], "newton-vbd-positive-j-guard-telemetry-v2")
+    test.assertEqual(payload["solver_step_epoch"], 1)
+    test.assertEqual(
+        payload["field_scopes"],
+        {
+            "local": "one_incident_tet_unscaled_candidate",
+            "aggregate": "one_particle_final_guard_decision",
+            "applied": "same_incident_tet_after_aggregate_alpha",
+        },
+    )
+    records = payload["records"]
+    record_keys = {
+        "solver_step_epoch",
+        "pass_ordinal",
+        "event_ordinal",
+        "site",
+        "particle_id",
+        "tet_id",
+        "local_reason",
+        "local_current_determinant_m3",
+        "local_determinant_floor_m3",
+        "local_unscaled_proposed_determinant_m3",
+        "aggregate_alpha",
+        "aggregate_decision",
+        "aggregate_nonlegacy_alpha",
+        "applied_determinant_m3",
+    }
+    assert_keys = [set(record) for record in records]
+    test.assertTrue(all(keys == record_keys for keys in assert_keys))
+    test.assertEqual(records, sorted(records, key=lambda row: (row["tet_id"], row["local_reason"], row["event_ordinal"])))
+    for record in records:
+        test.assertEqual(record["solver_step_epoch"], 1)
+        test.assertEqual(record["event_ordinal"], record["pass_ordinal"] * model.particle_count + record["particle_id"])
+    for reason, count in payload["reason_counts"].items():
+        test.assertGreaterEqual(count, sum(record["local_reason"] == reason for record in records))
+
+    state_next = model.state()
+    solver.step(state_out, state_next, model.control(clone_variables=False), None, 0.01)
+    test.assertEqual(solver.read_positive_j_guard_telemetry_v2()["solver_step_epoch"], 2)
+
+
+def _test_vbd_positive_j_scope_explicit_two_incident_tets(test, device):
+    """Separate local recovery truth from an aggregate block caused by another tet."""
+    builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    for position in (
+        (0.0, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 1.0),
+        (0.0, 0.0, -1.0),
+    ):
+        builder.add_particle(pos=wp.vec3(*position), vel=wp.vec3(0.0), mass=1.0)
+    builder.add_tetrahedron(0, 1, 2, 3, k_mu=1.0, k_lambda=1.0, k_damp=0.0)
+    builder.add_tetrahedron(0, 2, 1, 4, k_mu=1.0, k_lambda=1.0, k_damp=0.0)
+    builder.color()
+    model = builder.finalize(device=device)
+    solver = newton.solvers.SolverVBD(
+        model,
+        iterations=1,
+        particle_positive_j_guard_policy="recovery",
+        particle_positive_j_guard_telemetry=True,
+        particle_enable_tile_solve=False,
+        particle_collision_detection_interval=-1,
+    )
+    state = model.state()
+    current = model.particle_q.numpy().copy()
+    current[3, 2] = 5.0e-5
+    current[4, 2] = -5.0e-5
+    state.particle_q.assign(current.astype(np.float32))
+    displacement = np.zeros((model.particle_count, 3), dtype=np.float32)
+    displacement[0, 2] = 1.0e-4
+    solver.particle_displacements.assign(displacement)
+    solver._reset_positive_j_guard_telemetry()
+    solver._apply_guarded_particle_displacements(state.particle_q)
+    payload = solver.read_positive_j_guard_telemetry_v2()
+    records = [record for record in payload["records"] if record["particle_id"] == 0]
+    nonworsening = [record for record in records if record["local_reason"] == "recovery_nonworsening"]
+    decreasing = [record for record in records if record["local_reason"] == "recovery_decrease"]
+    test.assertEqual(len(nonworsening), 1)
+    test.assertEqual(len(decreasing), 1)
+    witness = nonworsening[0]
+    test.assertGreaterEqual(witness["local_unscaled_proposed_determinant_m3"], witness["local_current_determinant_m3"])
+    test.assertEqual(witness["aggregate_alpha"], 0.0)
+    test.assertFalse(witness["aggregate_decision"])
+    test.assertEqual(witness["applied_determinant_m3"], witness["local_current_determinant_m3"])
+    test.assertTrue(np.array_equal(state.particle_q.numpy()[0], current[0]))
 
 
 def _round6_solver_model(device):
@@ -4566,6 +4711,20 @@ add_function_test(
     TestSolverVBD,
     "test_vbd_positive_j_solver_paths",
     _test_vbd_positive_j_solver_paths,
+    devices=devices,
+)
+
+add_function_test(
+    TestSolverVBD,
+    "test_vbd_positive_j_scope_explicit_telemetry_v2",
+    _test_vbd_positive_j_scope_explicit_telemetry_v2,
+    devices=devices,
+)
+
+add_function_test(
+    TestSolverVBD,
+    "test_vbd_positive_j_scope_explicit_two_incident_tets",
+    _test_vbd_positive_j_scope_explicit_two_incident_tets,
     devices=devices,
 )
 
