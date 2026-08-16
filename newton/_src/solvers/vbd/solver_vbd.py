@@ -49,7 +49,9 @@ from .particle_vbd_kernels import (
     # Solver kernels (particle VBD)
     forward_step,
     reset_particle_state,
+    reset_particle_sweep_telemetry,
     reset_positive_j_guard_telemetry,
+    reduce_particle_sweep_position_update,
     solve_elasticity,
     solve_elasticity_tile,
     update_velocity,
@@ -299,6 +301,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         particle_external_edge_contact_filtering_map: dict | None = None,
         particle_positive_j_guard_policy: str = "legacy",
         particle_positive_j_guard_telemetry: bool = False,
+        particle_sweep_telemetry: bool = False,
         # Rigid body - constraint formulation and stabilization
         rigid_compliant_alm: bool | None = None,  # None retains legacy and emits the scoped migration warning
         rigid_avbd_alpha: float | None = None,  # Shared alpha override; None uses mode defaults
@@ -357,6 +360,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 iterations.
             particle_edge_parallel_epsilon: Threshold to detect near-parallel edges in edge-edge collision handling.
             particle_enable_tile_solve: Whether to accelerate the particle solver using tile API.
+            particle_sweep_telemetry: Whether to retain passive per-iteration complete-sweep particle update telemetry.
             particle_topological_contact_filter_threshold: Maximum topological distance (measured in rings) under which candidate
                 self-contacts are discarded. Set to a higher value to tolerate contacts between more closely connected mesh
                 elements. Only used when `particle_enable_self_contact` is `True`. Note that setting this to a value larger than 3 will
@@ -524,6 +528,8 @@ class SolverVBD(SolverBase, CouplingInterface):
             )
         if type(particle_positive_j_guard_telemetry) is not bool:
             raise TypeError("particle_positive_j_guard_telemetry must be a bool")
+        if type(particle_sweep_telemetry) is not bool:
+            raise TypeError("particle_sweep_telemetry must be a bool")
 
         integrates_rigid_bodies = model.body_count > 0 and not integrate_with_external_rigid_solver
 
@@ -614,6 +620,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.particle_positive_j_guard_policy = particle_positive_j_guard_policy
         self.particle_positive_j_guard_policy_code = int(particle_positive_j_guard_policy == "recovery")
         self.particle_positive_j_guard_telemetry = particle_positive_j_guard_telemetry
+        self.particle_sweep_telemetry = particle_sweep_telemetry
         self._joint_mode_deprecation_warned = False
 
         # Rigid integration mode: when True, rigid bodies are integrated by an external
@@ -686,6 +693,18 @@ class SolverVBD(SolverBase, CouplingInterface):
         particle_external_edge_contact_filtering_map: dict | None,
     ):
         """Initialize particle-specific data structures and settings."""
+        self.use_particle_tile_solve = particle_enable_tile_solve and self.model.device.is_cuda
+        self._particle_sweep_telemetry_enabled = bool(
+            self.particle_sweep_telemetry and model.particle_count > 0
+        )
+        self._particle_sweep_particle_q = None
+        self._particle_sweep_max_update = None
+        self._particle_sweep_finite = None
+        if self._particle_sweep_telemetry_enabled:
+            self._particle_sweep_particle_q = wp.zeros_like(model.particle_q, device=self.device)
+            self._particle_sweep_max_update = wp.zeros(self.iterations, dtype=float, device=self.device)
+            self._particle_sweep_finite = wp.zeros(self.iterations, dtype=wp.int32, device=self.device)
+
         self._positive_j_guard_reason_names = (
             "invalid_input",
             "legacy_floor_lock",
@@ -754,8 +773,6 @@ class SolverVBD(SolverBase, CouplingInterface):
         # Tile solve settings
         if model.device.is_cpu and particle_enable_tile_solve and wp.config.log_level <= wp.LOG_DEBUG:
             print("Info: Tiled solve requires model.device='cuda'. Tiled solve is disabled.")
-
-        self.use_particle_tile_solve = particle_enable_tile_solve and model.device.is_cuda
 
         if particle_enable_self_contact:
             if particle_self_contact_margin < particle_self_contact_radius:
@@ -849,6 +866,69 @@ class SolverVBD(SolverBase, CouplingInterface):
             "record_count": len(records),
             "records": records,
         }
+
+    def read_particle_sweep_telemetry(self):
+        """Return passive complete-sweep particle update telemetry for the last step."""
+        if not self.particle_sweep_telemetry:
+            return None
+
+        solve_mode = "tile" if self.use_particle_tile_solve else "scalar"
+        if solve_mode not in {"scalar", "tile"}:
+            raise RuntimeError("unsupported particle sweep telemetry solve mode")
+        particle_count = int(self.model.particle_count)
+        color_group_count = len(self.model.particle_color_groups)
+        iterations = int(self.iterations)
+        if particle_count == 0:
+            return {
+                "schema": "newton-vbd-particle-sweep-telemetry-v1",
+                "telemetry_enabled": True,
+                "solve_mode": solve_mode,
+                "particle_color_group_count": color_group_count,
+                "particle_count": particle_count,
+                "iterations": iterations,
+                "max_particle_position_update_m": [],
+                "finite": [],
+            }
+
+        max_update = self._particle_sweep_max_update
+        finite = self._particle_sweep_finite
+        snapshot = self._particle_sweep_particle_q
+        if max_update is None or finite is None or snapshot is None:
+            raise RuntimeError("particle sweep telemetry buffers are missing")
+        if max_update.shape != (iterations,) or finite.shape != (iterations,) or snapshot.shape != self.model.particle_q.shape:
+            raise RuntimeError("particle sweep telemetry buffer shape differs")
+        values = self._to_numpy(max_update, dtype=np.float64).reshape(-1)
+        flags = self._to_numpy(finite, dtype=np.int32).reshape(-1)
+        if values.shape != (iterations,) or flags.shape != (iterations,):
+            raise RuntimeError("particle sweep telemetry buffer length differs")
+        if not np.isfinite(values).all() or np.any(values < 0.0) or not np.isin(flags, (0, 1)).all():
+            raise RuntimeError("particle sweep telemetry contains a nonfinite or invalid output")
+        return {
+            "schema": "newton-vbd-particle-sweep-telemetry-v1",
+            "telemetry_enabled": True,
+            "solve_mode": solve_mode,
+            "particle_color_group_count": color_group_count,
+            "particle_count": particle_count,
+            "iterations": iterations,
+            "max_particle_position_update_m": values.tolist(),
+            "finite": [bool(value) for value in flags],
+        }
+
+    def _reset_particle_sweep_telemetry(self):
+        if not self._particle_sweep_telemetry_enabled:
+            return
+        max_update = self._particle_sweep_max_update
+        finite = self._particle_sweep_finite
+        if max_update is None or finite is None or max_update.shape != (int(self.iterations),) or finite.shape != (int(self.iterations),):
+            raise RuntimeError("particle sweep telemetry buffers are malformed")
+        if int(self.iterations) == 0:
+            return
+        wp.launch(
+            kernel=reset_particle_sweep_telemetry,
+            dim=int(self.iterations),
+            inputs=[max_update, finite],
+            device=self.device,
+        )
 
     def _reset_positive_j_guard_telemetry(self):
         if not self._positive_j_guard_enabled:
@@ -2231,6 +2311,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 need to be allocated or grown during graph capture.
         """
         self._apply_module_options()
+        self._reset_particle_sweep_telemetry()
         self._reset_positive_j_guard_telemetry()
         update_rigid = self._update_rigid_history
         self._update_rigid_history = True
@@ -2243,7 +2324,27 @@ class SolverVBD(SolverBase, CouplingInterface):
 
         for iter_num in range(self.iterations):
             self._solve_rigid_body_iteration(state_in, state_out, control, contacts, dt)
+            if self._particle_sweep_telemetry_enabled:
+                particle_q_snapshot = self._particle_sweep_particle_q
+                max_update = self._particle_sweep_max_update
+                finite = self._particle_sweep_finite
+                if particle_q_snapshot is None or max_update is None or finite is None:
+                    raise RuntimeError("particle sweep telemetry buffers are missing")
+                wp.copy(particle_q_snapshot, state_in.particle_q)
             self._solve_particle_iteration(state_in, state_out, contacts, dt, iter_num)
+            if self._particle_sweep_telemetry_enabled:
+                wp.launch(
+                    kernel=reduce_particle_sweep_position_update,
+                    dim=self.model.particle_count,
+                    inputs=[
+                        self._particle_sweep_particle_q,
+                        state_in.particle_q,
+                        iter_num,
+                        self._particle_sweep_max_update,
+                        self._particle_sweep_finite,
+                    ],
+                    device=self.device,
+                )
 
         # Snapshot solved rigid contact state for next-frame warm-start.
         self._snapshot_rigid_contact_history(contacts)

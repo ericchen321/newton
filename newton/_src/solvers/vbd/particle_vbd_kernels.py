@@ -68,6 +68,50 @@ POSITIVE_J_GUARD_SITE_SCALAR = 2
 POSITIVE_J_GUARD_EVENT_ORDINAL_MAX = 2**31 - 1
 
 
+@wp.kernel
+def reset_particle_sweep_telemetry(
+    max_particle_position_update_m: wp.array[float],
+    finite: wp.array[wp.int32],
+):
+    """Reset one complete-sweep telemetry slot before a VBD step."""
+    iteration = wp.tid()
+    max_particle_position_update_m[iteration] = 0.0
+    finite[iteration] = 1
+
+
+@wp.kernel
+def reduce_particle_sweep_position_update(
+    particle_q_before: wp.array[wp.vec3],
+    particle_q_after: wp.array[wp.vec3],
+    iteration: int,
+    max_particle_position_update_m: wp.array[float],
+    finite: wp.array[wp.int32],
+):
+    """Reduce the maximum finite net particle update for one complete sweep."""
+    particle = wp.tid()
+    before = particle_q_before[particle]
+    after = particle_q_after[particle]
+    delta = after - before
+    if (
+        not wp.isfinite(before[0])
+        or not wp.isfinite(before[1])
+        or not wp.isfinite(before[2])
+        or not wp.isfinite(after[0])
+        or not wp.isfinite(after[1])
+        or not wp.isfinite(after[2])
+        or not wp.isfinite(delta[0])
+        or not wp.isfinite(delta[1])
+        or not wp.isfinite(delta[2])
+    ):
+        wp.atomic_min(finite, iteration, wp.int32(0))
+        return
+    update = wp.length(delta)
+    if not wp.isfinite(update) or update < 0.0:
+        wp.atomic_min(finite, iteration, wp.int32(0))
+        return
+    wp.atomic_max(max_particle_position_update_m, iteration, update)
+
+
 class mat32(wp.types.matrix(shape=(3, 2), dtype=wp.float32)):
     pass
 

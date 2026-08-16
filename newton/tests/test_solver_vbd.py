@@ -4467,6 +4467,55 @@ def _test_vbd_positive_j_color_invariants(test, device):
             newton.solvers.SolverVBD(model, iterations=1)
 
 
+def _test_vbd_particle_sweep_telemetry(test, device):
+    """Verify passive complete-sweep telemetry and solver-state equivalence."""
+    disabled_model = _round6_solver_model(device)
+    disabled = newton.solvers.SolverVBD(
+        disabled_model,
+        iterations=1,
+        particle_enable_tile_solve=False,
+        particle_collision_detection_interval=-1,
+    )
+    test.assertIsNone(disabled.read_particle_sweep_telemetry())
+    with test.assertRaises(TypeError):
+        newton.solvers.SolverVBD(disabled_model, particle_sweep_telemetry=1)
+
+    def run(enabled, tile_solve):
+        model = _round6_solver_model(device)
+        solver = newton.solvers.SolverVBD(
+            model,
+            iterations=1,
+            particle_enable_tile_solve=tile_solve,
+            particle_collision_detection_interval=-1,
+            particle_sweep_telemetry=enabled,
+        )
+        state_in = model.state()
+        state_out = model.state()
+        initial = model.particle_q.numpy().copy()
+        initial[0, 2] = 0.9
+        state_in.particle_q.assign(initial)
+        state_in.particle_qd.zero_()
+        before = state_in.particle_q.numpy().copy()
+        solver.step(state_in, state_out, model.control(clone_variables=False), None, 0.01)
+        after = state_out.particle_q.numpy().copy()
+        return after, solver.read_particle_sweep_telemetry(), before
+
+    for tile_solve in (False, True) if device.is_cuda else (False,):
+        off_output, off_telemetry, before = run(False, tile_solve)
+        on_output, telemetry, _ = run(True, tile_solve)
+        test.assertIsNone(off_telemetry)
+        test.assertTrue(np.array_equal(off_output, on_output))
+        test.assertIsNotNone(telemetry)
+        test.assertEqual(telemetry["schema"], "newton-vbd-particle-sweep-telemetry-v1")
+        test.assertEqual(telemetry["solve_mode"], "tile" if tile_solve and device.is_cuda else "scalar")
+        test.assertEqual(telemetry["particle_color_group_count"], 4)
+        test.assertEqual(telemetry["particle_count"], 4)
+        test.assertEqual(telemetry["iterations"], 1)
+        test.assertEqual(telemetry["finite"], [True])
+        expected = float(np.max(np.linalg.norm(on_output - before, axis=1)))
+        test.assertAlmostEqual(telemetry["max_particle_position_update_m"][0], expected, places=6)
+
+
 class TestSolverVBD(unittest.TestCase):
     pass
 
@@ -4559,6 +4608,13 @@ add_function_test(
     TestSolverVBD,
     "test_vbd_positive_j_color_invariants",
     _test_vbd_positive_j_color_invariants,
+    devices=devices,
+)
+
+add_function_test(
+    TestSolverVBD,
+    "test_vbd_particle_sweep_telemetry",
+    _test_vbd_particle_sweep_telemetry,
     devices=devices,
 )
 
