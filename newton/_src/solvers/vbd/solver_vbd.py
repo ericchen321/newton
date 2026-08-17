@@ -32,28 +32,30 @@ from ..xpbd.kernels import apply_joint_forces
 from . import particle_vbd_kernels, rigid_vbd_kernels, vbd_coupling_kernels
 from .particle_vbd_kernels import (
     NUM_THREADS_PER_COLLISION_PRIMITIVE,
+    PARTICLE_ACTIVE_SET_CYCLE_REASON_COUNT,
     POSITIVE_J_GUARD_EVENT_ORDINAL_MAX,
     POSITIVE_J_GUARD_REASON_COUNT,
     POSITIVE_J_GUARD_SITE_INITIALIZER,
     POSITIVE_J_GUARD_SITE_SCALAR,
     POSITIVE_J_GUARD_SITE_TILE,
-    PARTICLE_ACTIVE_SET_CYCLE_REASON_COUNT,
     TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
     # Topological filtering helper functions
     accumulate_particle_body_contact_force_and_hessian,
     accumulate_self_contact_force_and_hessian,
     accumulate_spring_force_and_hessian,
-    capture_particle_active_set_cycle_state,
     # Planar DAT (Divide and Truncate) kernels
     apply_guarded_particle_displacements,
     apply_planar_truncation_parallel_by_collision,
     apply_truncation_ts,
+    capture_particle_active_set_cycle_state,
+    capture_particle_constitutive_objective_audit,
+    capture_particle_constitutive_objective_audit_state,
     # Solver kernels (particle VBD)
     forward_step,
+    reduce_particle_sweep_position_update,
     reset_particle_state,
     reset_particle_sweep_telemetry,
     reset_positive_j_guard_telemetry,
-    reduce_particle_sweep_position_update,
     solve_elasticity,
     solve_elasticity_tile,
     update_velocity,
@@ -305,6 +307,8 @@ class SolverVBD(SolverBase, CouplingInterface):
         particle_positive_j_guard_telemetry: bool = False,
         particle_sweep_telemetry: bool = False,
         particle_active_set_cycle_telemetry: bool = False,
+        particle_constitutive_objective_audit: bool = False,
+        particle_constitutive_objective_audit_probe_epochs: tuple[int, ...] = (),
         # Rigid body - constraint formulation and stabilization
         rigid_compliant_alm: bool | None = None,  # None retains legacy and emits the scoped migration warning
         rigid_avbd_alpha: float | None = None,  # Shared alpha override; None uses mode defaults
@@ -365,6 +369,8 @@ class SolverVBD(SolverBase, CouplingInterface):
             particle_enable_tile_solve: Whether to accelerate the particle solver using tile API.
             particle_sweep_telemetry: Whether to retain passive per-iteration complete-sweep particle update telemetry.
             particle_active_set_cycle_telemetry: Whether to retain passive per-sweep positive-J active-set cycle telemetry.
+            particle_constitutive_objective_audit: Whether to retain the opt-in passive local constitutive/objective audit.
+            particle_constitutive_objective_audit_probe_epochs: One-based solver step epochs at which the audit may be read.
             particle_topological_contact_filter_threshold: Maximum topological distance (measured in rings) under which candidate
                 self-contacts are discarded. Set to a higher value to tolerate contacts between more closely connected mesh
                 elements. Only used when `particle_enable_self_contact` is `True`. Note that setting this to a value larger than 3 will
@@ -527,15 +533,30 @@ class SolverVBD(SolverBase, CouplingInterface):
         if not isinstance(particle_positive_j_guard_policy, str):
             raise TypeError("particle_positive_j_guard_policy must be a string")
         if particle_positive_j_guard_policy not in {"legacy", "recovery"}:
-            raise ValueError(
-                "particle_positive_j_guard_policy must be one of {'legacy', 'recovery'}"
-            )
+            raise ValueError("particle_positive_j_guard_policy must be one of {'legacy', 'recovery'}")
         if type(particle_positive_j_guard_telemetry) is not bool:
             raise TypeError("particle_positive_j_guard_telemetry must be a bool")
         if type(particle_sweep_telemetry) is not bool:
             raise TypeError("particle_sweep_telemetry must be a bool")
         if type(particle_active_set_cycle_telemetry) is not bool:
             raise TypeError("particle_active_set_cycle_telemetry must be a bool")
+        if type(particle_constitutive_objective_audit) is not bool:
+            raise TypeError("particle_constitutive_objective_audit must be a bool")
+        if not isinstance(particle_constitutive_objective_audit_probe_epochs, tuple):
+            raise TypeError("particle_constitutive_objective_audit_probe_epochs must be a tuple")
+        if (
+            any(
+                isinstance(epoch, bool) or not isinstance(epoch, int) or epoch <= 0
+                for epoch in particle_constitutive_objective_audit_probe_epochs
+            )
+            or tuple(sorted(set(particle_constitutive_objective_audit_probe_epochs)))
+            != particle_constitutive_objective_audit_probe_epochs
+        ):
+            raise ValueError(
+                "particle_constitutive_objective_audit_probe_epochs must be a sorted tuple of unique positive ints"
+            )
+        if not particle_constitutive_objective_audit and particle_constitutive_objective_audit_probe_epochs:
+            raise ValueError("particle_constitutive_objective_audit_probe_epochs require the audit to be enabled")
 
         integrates_rigid_bodies = model.body_count > 0 and not integrate_with_external_rigid_solver
 
@@ -628,6 +649,8 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.particle_positive_j_guard_telemetry = particle_positive_j_guard_telemetry
         self.particle_sweep_telemetry = particle_sweep_telemetry
         self.particle_active_set_cycle_telemetry = particle_active_set_cycle_telemetry
+        self.particle_constitutive_objective_audit = particle_constitutive_objective_audit
+        self.particle_constitutive_objective_audit_probe_epochs = particle_constitutive_objective_audit_probe_epochs
         self._joint_mode_deprecation_warned = False
 
         # Rigid integration mode: when True, rigid bodies are integrated by an external
@@ -701,9 +724,7 @@ class SolverVBD(SolverBase, CouplingInterface):
     ):
         """Initialize particle-specific data structures and settings."""
         self.use_particle_tile_solve = particle_enable_tile_solve and self.model.device.is_cuda
-        self._particle_sweep_telemetry_enabled = bool(
-            self.particle_sweep_telemetry and model.particle_count > 0
-        )
+        self._particle_sweep_telemetry_enabled = bool(self.particle_sweep_telemetry and model.particle_count > 0)
         self._particle_sweep_particle_q = None
         self._particle_sweep_max_update = None
         self._particle_sweep_finite = None
@@ -739,14 +760,67 @@ class SolverVBD(SolverBase, CouplingInterface):
             total_events = pass_count * event_capacity
             self._particle_active_set_cycle_event_counts = wp.zeros(pass_count, dtype=wp.int32, device=self.device)
             self._particle_active_set_cycle_event_tet_ids = wp.zeros(total_events, dtype=wp.int32, device=self.device)
-            self._particle_active_set_cycle_event_particle_ids = wp.zeros(total_events, dtype=wp.int32, device=self.device)
-            self._particle_active_set_cycle_event_local_reasons = wp.zeros(total_events, dtype=wp.int32, device=self.device)
+            self._particle_active_set_cycle_event_particle_ids = wp.zeros(
+                total_events, dtype=wp.int32, device=self.device
+            )
+            self._particle_active_set_cycle_event_local_reasons = wp.zeros(
+                total_events, dtype=wp.int32, device=self.device
+            )
             self._particle_active_set_cycle_event_decisions = wp.zeros(total_events, dtype=wp.int32, device=self.device)
-            self._particle_active_set_cycle_event_postcheck_rejected = wp.zeros(total_events, dtype=wp.int32, device=self.device)
+            self._particle_active_set_cycle_event_postcheck_rejected = wp.zeros(
+                total_events, dtype=wp.int32, device=self.device
+            )
             self._particle_active_set_cycle_reason_counts = wp.zeros(
                 pass_count * PARTICLE_ACTIVE_SET_CYCLE_REASON_COUNT, dtype=wp.int32, device=self.device
             )
             self._particle_active_set_cycle_overflow = wp.zeros(pass_count, dtype=wp.int32, device=self.device)
+
+        self._particle_constitutive_objective_audit_enabled = bool(
+            self.particle_constitutive_objective_audit and model.particle_count > 0 and model.tet_count > 0
+        )
+        self._particle_constitutive_objective_audit_pass_count = 0
+        self._particle_constitutive_objective_audit_snapshots = None
+        self._particle_constitutive_objective_audit_prior = None
+        self._particle_constitutive_objective_audit_row_valid = None
+        self._particle_constitutive_objective_audit_solve_valid = None
+        self._particle_constitutive_objective_audit_force = []
+        self._particle_constitutive_objective_audit_hessian = []
+        self._particle_constitutive_objective_audit_displacement_before = None
+        self._particle_constitutive_objective_audit_proposed = None
+        self._particle_constitutive_objective_audit_applied = None
+        self._particle_constitutive_objective_audit_step_epoch = 0
+        self._particle_constitutive_objective_audit_last_read_epoch = 0
+        self._particle_constitutive_objective_audit_capture_active = False
+        if self._particle_constitutive_objective_audit_enabled:
+            color_group_count = len(model.particle_color_groups)
+            pass_count = int(self.iterations) * color_group_count
+            if color_group_count <= 0 or pass_count <= 0:
+                raise ValueError("particle constitutive objective audit metadata is malformed")
+            row_count = pass_count * int(model.particle_count)
+            self._particle_constitutive_objective_audit_pass_count = pass_count
+            self._particle_constitutive_objective_audit_snapshots = wp.zeros(
+                (pass_count + 1, int(model.particle_count)), dtype=wp.vec3, device=self.device
+            )
+            self._particle_constitutive_objective_audit_prior = wp.zeros_like(model.particle_q, device=self.device)
+            self._particle_constitutive_objective_audit_row_valid = wp.zeros(
+                row_count, dtype=wp.int32, device=self.device
+            )
+            self._particle_constitutive_objective_audit_solve_valid = wp.zeros(
+                row_count, dtype=wp.int32, device=self.device
+            )
+            self._particle_constitutive_objective_audit_force = [
+                wp.zeros(row_count, dtype=wp.vec3, device=self.device) for _ in range(5)
+            ]
+            self._particle_constitutive_objective_audit_hessian = [
+                wp.zeros(row_count, dtype=wp.mat33, device=self.device) for _ in range(5)
+            ]
+            self._particle_constitutive_objective_audit_displacement_before = wp.zeros(
+                row_count, dtype=wp.vec3, device=self.device
+            )
+            self._particle_constitutive_objective_audit_proposed = wp.zeros(
+                row_count, dtype=wp.vec3, device=self.device
+            )
+            self._particle_constitutive_objective_audit_applied = wp.zeros(row_count, dtype=wp.vec3, device=self.device)
 
         self._positive_j_guard_reason_names = (
             "invalid_input",
@@ -761,9 +835,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             1: "tile",
             2: "scalar",
         }
-        self._positive_j_guard_enabled = bool(
-            self.particle_positive_j_guard_telemetry and model.tet_count > 0
-        )
+        self._positive_j_guard_enabled = bool(self.particle_positive_j_guard_telemetry and model.tet_count > 0)
         self._positive_j_guard_step_epoch = 0
         telemetry_slots = model.tet_count * POSITIVE_J_GUARD_REASON_COUNT if self._positive_j_guard_enabled else 0
         self._positive_j_guard_event_ordinal = wp.full(
@@ -772,12 +844,8 @@ class SolverVBD(SolverBase, CouplingInterface):
             dtype=wp.int32,
             device=self.device,
         )
-        self._positive_j_guard_event_solver_step_epoch = wp.zeros(
-            telemetry_slots, dtype=wp.int32, device=self.device
-        )
-        self._positive_j_guard_event_pass_ordinal = wp.zeros(
-            telemetry_slots, dtype=wp.int32, device=self.device
-        )
+        self._positive_j_guard_event_solver_step_epoch = wp.zeros(telemetry_slots, dtype=wp.int32, device=self.device)
+        self._positive_j_guard_event_pass_ordinal = wp.zeros(telemetry_slots, dtype=wp.int32, device=self.device)
         self._positive_j_guard_event_site = wp.zeros(telemetry_slots, dtype=wp.int32, device=self.device)
         self._positive_j_guard_event_particle_id = wp.zeros(telemetry_slots, dtype=wp.int32, device=self.device)
         self._positive_j_guard_event_tet_id = wp.zeros(telemetry_slots, dtype=wp.int32, device=self.device)
@@ -921,8 +989,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             "policy": self.particle_positive_j_guard_policy,
             "telemetry_enabled": True,
             "reason_counts": {
-                reason: int(reason_counts[index])
-                for index, reason in enumerate(self._positive_j_guard_reason_names)
+                reason: int(reason_counts[index]) for index, reason in enumerate(self._positive_j_guard_reason_names)
             },
             "record_count": len(records),
             "records": records,
@@ -966,7 +1033,11 @@ class SolverVBD(SolverBase, CouplingInterface):
             if array is None or not hasattr(array, "shape") or tuple(array.shape) != (expected_slots,):
                 raise RuntimeError(f"positive-J guard telemetry {name} buffer shape differs")
         reason_counts_array = self._positive_j_guard_reason_counts
-        if reason_counts_array is None or not hasattr(reason_counts_array, "shape") or tuple(reason_counts_array.shape) != (POSITIVE_J_GUARD_REASON_COUNT,):
+        if (
+            reason_counts_array is None
+            or not hasattr(reason_counts_array, "shape")
+            or tuple(reason_counts_array.shape) != (POSITIVE_J_GUARD_REASON_COUNT,)
+        ):
             raise RuntimeError("positive-J guard telemetry reason counter shape differs")
 
         ordinals = self._to_numpy(arrays["event_ordinal"], dtype=np.int64).reshape(-1)
@@ -982,15 +1053,13 @@ class SolverVBD(SolverBase, CouplingInterface):
         decisions = self._to_numpy(arrays["event_decision"], dtype=np.int64).reshape(-1)
         nonlegacy_alphas = self._to_numpy(arrays["event_nonlegacy_alpha"], dtype=float).reshape(-1)
         applied = self._to_numpy(arrays["event_applied_determinant"], dtype=float).reshape(-1)
-        pre_postcheck_alphas = self._to_numpy(
-            arrays["event_pre_postcheck_aggregate_alpha"], dtype=float
-        ).reshape(-1)
+        pre_postcheck_alphas = self._to_numpy(arrays["event_pre_postcheck_aggregate_alpha"], dtype=float).reshape(-1)
         pre_postcheck_nonlegacy_alphas = self._to_numpy(
             arrays["event_pre_postcheck_nonlegacy_alpha"], dtype=float
         ).reshape(-1)
-        pre_postcheck_applied = self._to_numpy(
-            arrays["event_pre_postcheck_applied_determinant"], dtype=float
-        ).reshape(-1)
+        pre_postcheck_applied = self._to_numpy(arrays["event_pre_postcheck_applied_determinant"], dtype=float).reshape(
+            -1
+        )
         reason_counts = self._to_numpy(reason_counts_array, dtype=np.int64).reshape(-1)
         if any(
             values.shape != (expected_slots,)
@@ -1059,10 +1128,21 @@ class SolverVBD(SolverBase, CouplingInterface):
             particle_id = int(particle_ids[slot])
             tet_id = int(tet_ids[slot])
             decision = int(decisions[slot])
-            if epoch != step_epoch or pass_ordinal < 0 or site not in self._positive_j_guard_site_names or not 0 <= particle_id < particle_count or not 0 <= tet_id < tet_count or decision not in (0, 1):
+            if (
+                epoch != step_epoch
+                or pass_ordinal < 0
+                or site not in self._positive_j_guard_site_names
+                or not 0 <= particle_id < particle_count
+                or not 0 <= tet_id < tet_count
+                or decision not in (0, 1)
+            ):
                 raise RuntimeError("positive-J guard telemetry winning slot is malformed")
             expected_ordinal = pass_ordinal * particle_count + particle_id
-            if expected_ordinal != ordinal or expected_ordinal < 0 or expected_ordinal >= POSITIVE_J_GUARD_EVENT_ORDINAL_MAX:
+            if (
+                expected_ordinal != ordinal
+                or expected_ordinal < 0
+                or expected_ordinal >= POSITIVE_J_GUARD_EVENT_ORDINAL_MAX
+            ):
                 raise RuntimeError("positive-J guard telemetry event ordinal mapping differs")
             reason_index = slot % POSITIVE_J_GUARD_REASON_COUNT
             records.append(
@@ -1089,10 +1169,13 @@ class SolverVBD(SolverBase, CouplingInterface):
         if any(int(value) < 0 for value in reason_counts):
             raise RuntimeError("positive-J guard telemetry reason counters are malformed")
         records.sort(key=lambda record: (record["tet_id"], record["local_reason"], record["event_ordinal"]))
-        representatives = {reason: 0 for reason in self._positive_j_guard_reason_names}
+        representatives = dict.fromkeys(self._positive_j_guard_reason_names, 0)
         for record in records:
             representatives[record["local_reason"]] += 1
-        if any(int(reason_counts[index]) < representatives[reason] for index, reason in enumerate(self._positive_j_guard_reason_names)):
+        if any(
+            int(reason_counts[index]) < representatives[reason]
+            for index, reason in enumerate(self._positive_j_guard_reason_names)
+        ):
             raise RuntimeError("positive-J guard telemetry counters under-report representatives")
         return {
             "schema": "newton-vbd-positive-j-guard-telemetry-v2",
@@ -1111,8 +1194,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 "pre_postcheck_applied": "same_incident_tet_after_analytic_aggregate_alpha_before_applied_postcheck",
             },
             "reason_counts": {
-                reason: int(reason_counts[index])
-                for index, reason in enumerate(self._positive_j_guard_reason_names)
+                reason: int(reason_counts[index]) for index, reason in enumerate(self._positive_j_guard_reason_names)
             },
             "record_count": len(records),
             "records": records,
@@ -1146,7 +1228,11 @@ class SolverVBD(SolverBase, CouplingInterface):
         snapshot = self._particle_sweep_particle_q
         if max_update is None or finite is None or snapshot is None:
             raise RuntimeError("particle sweep telemetry buffers are missing")
-        if max_update.shape != (iterations,) or finite.shape != (iterations,) or snapshot.shape != self.model.particle_q.shape:
+        if (
+            max_update.shape != (iterations,)
+            or finite.shape != (iterations,)
+            or snapshot.shape != self.model.particle_q.shape
+        ):
             raise RuntimeError("particle sweep telemetry buffer shape differs")
         values = self._to_numpy(max_update, dtype=np.float64).reshape(-1)
         flags = self._to_numpy(finite, dtype=np.int32).reshape(-1)
@@ -1242,7 +1328,10 @@ class SolverVBD(SolverBase, CouplingInterface):
         if (
             counts.shape != (pass_count,)
             or overflows.shape != (pass_count,)
-            or any(values.shape != (pass_count * capacity,) for values in (tet_ids, particle_ids, reasons, decisions, postchecks))
+            or any(
+                values.shape != (pass_count * capacity,)
+                for values in (tet_ids, particle_ids, reasons, decisions, postchecks)
+            )
             or reason_counts.shape != (pass_count * PARTICLE_ACTIVE_SET_CYCLE_REASON_COUNT,)
         ):
             raise RuntimeError("particle active-set cycle telemetry readback lengths differ")
@@ -1263,7 +1352,11 @@ class SolverVBD(SolverBase, CouplingInterface):
                 postcheck_rejected = int(postchecks[slot])
                 if not 0 <= tet_id < tet_count or not 0 <= particle_id < particle_count:
                     raise RuntimeError("particle active-set cycle event index is out of range")
-                if not 0 <= local_reason < PARTICLE_ACTIVE_SET_CYCLE_REASON_COUNT or decision not in (0, 1) or postcheck_rejected not in (0, 1):
+                if (
+                    not 0 <= local_reason < PARTICLE_ACTIVE_SET_CYCLE_REASON_COUNT
+                    or decision not in (0, 1)
+                    or postcheck_rejected not in (0, 1)
+                ):
                     raise RuntimeError("particle active-set cycle event tuple is malformed")
                 if postcheck_rejected != int(local_reason == 5):
                     raise RuntimeError("particle active-set cycle postcheck flag is malformed")
@@ -1274,11 +1367,18 @@ class SolverVBD(SolverBase, CouplingInterface):
                 records.append((tet_id, particle_id, local_reason, decision, postcheck_rejected))
             records.sort()
             expected_counts = reason_counts[
-                pass_ordinal * PARTICLE_ACTIVE_SET_CYCLE_REASON_COUNT : (pass_ordinal + 1) * PARTICLE_ACTIVE_SET_CYCLE_REASON_COUNT
+                pass_ordinal * PARTICLE_ACTIVE_SET_CYCLE_REASON_COUNT : (pass_ordinal + 1)
+                * PARTICLE_ACTIVE_SET_CYCLE_REASON_COUNT
             ]
             if any(int(value) < 0 for value in expected_counts) or int(np.sum(expected_counts)) != count:
                 raise RuntimeError("particle active-set cycle reason counts do not reconcile")
-            passes.append({"pass_ordinal": pass_ordinal, "reason_counts": [int(value) for value in expected_counts], "records": records})
+            passes.append(
+                {
+                    "pass_ordinal": pass_ordinal,
+                    "reason_counts": [int(value) for value in expected_counts],
+                    "records": records,
+                }
+            )
         return {
             "schema": "newton-vbd-particle-active-set-cycle-telemetry-v1",
             "telemetry_enabled": True,
@@ -1291,12 +1391,204 @@ class SolverVBD(SolverBase, CouplingInterface):
             "passes": passes,
         }
 
+    def _prepare_particle_constitutive_objective_audit(self, state_in) -> None:
+        """Prepare the fixed H5 buffers for the next solver step."""
+        if not self._particle_constitutive_objective_audit_enabled:
+            self._particle_constitutive_objective_audit_capture_active = False
+            return
+        if self._particle_constitutive_objective_audit_step_epoch >= 2**31 - 1:
+            raise OverflowError("particle constitutive objective audit step epoch exceeded int32 range")
+        self._particle_constitutive_objective_audit_step_epoch += 1
+        self._particle_constitutive_objective_audit_capture_active = (
+            self._particle_constitutive_objective_audit_step_epoch
+            in self.particle_constitutive_objective_audit_probe_epochs
+        )
+        if not self._particle_constitutive_objective_audit_capture_active:
+            return
+        snapshots = self._particle_constitutive_objective_audit_snapshots
+        prior = self._particle_constitutive_objective_audit_prior
+        if snapshots is None or prior is None:
+            raise RuntimeError("particle constitutive objective audit buffers are missing")
+        wp.copy(prior, state_in.particle_q)
+        snapshots.zero_()
+        for array in (
+            self._particle_constitutive_objective_audit_row_valid,
+            self._particle_constitutive_objective_audit_solve_valid,
+            self._particle_constitutive_objective_audit_displacement_before,
+            self._particle_constitutive_objective_audit_proposed,
+            self._particle_constitutive_objective_audit_applied,
+            *self._particle_constitutive_objective_audit_force,
+            *self._particle_constitutive_objective_audit_hessian,
+        ):
+            if array is None:
+                raise RuntimeError("particle constitutive objective audit buffer is missing")
+            array.zero_()
+
+    def _capture_particle_constitutive_objective_audit_state(self, particle_q, snapshot_ordinal: int) -> None:
+        if not self._particle_constitutive_objective_audit_capture_active:
+            return
+        snapshots = self._particle_constitutive_objective_audit_snapshots
+        if (
+            snapshots is None
+            or not 0 <= int(snapshot_ordinal) <= self._particle_constitutive_objective_audit_pass_count
+        ):
+            raise RuntimeError("particle constitutive objective audit snapshot ordinal is malformed")
+        wp.launch(
+            kernel=capture_particle_constitutive_objective_audit_state,
+            dim=int(self.model.particle_count),
+            inputs=[particle_q, snapshots, int(snapshot_ordinal)],
+            device=self.device,
+        )
+
+    def _capture_particle_constitutive_objective_audit_pass(self, state_in, dt: float, pass_ordinal: int) -> None:
+        if not self._particle_constitutive_objective_audit_capture_active:
+            return
+        if not 0 <= int(pass_ordinal) < self._particle_constitutive_objective_audit_pass_count:
+            raise RuntimeError("particle constitutive objective audit pass ordinal is malformed")
+        snapshots = self._particle_constitutive_objective_audit_snapshots
+        row_valid = self._particle_constitutive_objective_audit_row_valid
+        solve_valid = self._particle_constitutive_objective_audit_solve_valid
+        before = self._particle_constitutive_objective_audit_displacement_before
+        proposed = self._particle_constitutive_objective_audit_proposed
+        applied = self._particle_constitutive_objective_audit_applied
+        if (
+            snapshots is None
+            or row_valid is None
+            or solve_valid is None
+            or before is None
+            or proposed is None
+            or applied is None
+        ):
+            raise RuntimeError("particle constitutive objective audit buffers are missing")
+        if (
+            len(self._particle_constitutive_objective_audit_force) != 5
+            or len(self._particle_constitutive_objective_audit_hessian) != 5
+        ):
+            raise RuntimeError("particle constitutive objective audit component buffers are malformed")
+        wp.launch(
+            kernel=capture_particle_constitutive_objective_audit,
+            dim=int(self.model.particle_count),
+            inputs=[
+                float(dt),
+                int(pass_ordinal),
+                int(self.model.particle_count),
+                self.particle_q_prev,
+                state_in.particle_q,
+                self.model.particle_mass,
+                self.inertia,
+                self.model.particle_flags,
+                self.model.tet_indices,
+                self.model.tet_poses,
+                self.model.tet_materials,
+                self.particle_adjacency,
+                self.particle_forces,
+                self.particle_hessians,
+                self.particle_displacements,
+                snapshots,
+                row_valid,
+                solve_valid,
+                self._particle_constitutive_objective_audit_force[0],
+                self._particle_constitutive_objective_audit_force[1],
+                self._particle_constitutive_objective_audit_force[2],
+                self._particle_constitutive_objective_audit_force[3],
+                self._particle_constitutive_objective_audit_force[4],
+                self._particle_constitutive_objective_audit_hessian[0],
+                self._particle_constitutive_objective_audit_hessian[1],
+                self._particle_constitutive_objective_audit_hessian[2],
+                self._particle_constitutive_objective_audit_hessian[3],
+                self._particle_constitutive_objective_audit_hessian[4],
+                before,
+                proposed,
+                applied,
+            ],
+            device=self.device,
+        )
+
+    def read_particle_constitutive_objective_audit_telemetry(self):
+        """Read one validated, finite H5 envelope after a configured probe step."""
+        if not self.particle_constitutive_objective_audit:
+            raise RuntimeError("particle constitutive objective audit is disabled")
+        if not self._particle_constitutive_objective_audit_enabled:
+            raise RuntimeError("particle constitutive objective audit has no particle/tet system")
+        epoch = int(self._particle_constitutive_objective_audit_step_epoch)
+        if epoch not in self.particle_constitutive_objective_audit_probe_epochs:
+            raise RuntimeError("particle constitutive objective audit is not available for this step epoch")
+        if epoch == int(self._particle_constitutive_objective_audit_last_read_epoch):
+            raise RuntimeError("particle constitutive objective audit envelope was already read")
+        if not self._particle_constitutive_objective_audit_capture_active:
+            raise RuntimeError("particle constitutive objective audit capture is stale")
+        snapshots = self._particle_constitutive_objective_audit_snapshots
+        row_valid = self._particle_constitutive_objective_audit_row_valid
+        solve_valid = self._particle_constitutive_objective_audit_solve_valid
+        before = self._particle_constitutive_objective_audit_displacement_before
+        proposed = self._particle_constitutive_objective_audit_proposed
+        applied = self._particle_constitutive_objective_audit_applied
+        if (
+            snapshots is None
+            or row_valid is None
+            or solve_valid is None
+            or before is None
+            or proposed is None
+            or applied is None
+        ):
+            raise RuntimeError("particle constitutive objective audit buffers are missing")
+
+        def array_values(array, dtype):
+            values = self._to_numpy(array, dtype=dtype)
+            if not np.isfinite(values).all():
+                raise RuntimeError("particle constitutive objective audit contains a nonfinite value")
+            return values
+
+        snapshot_values = array_values(snapshots, np.float32)
+        row_valid_values = self._to_numpy(row_valid, dtype=np.int32).reshape(-1)
+        solve_valid_values = self._to_numpy(solve_valid, dtype=np.int32).reshape(-1)
+        if not np.isin(row_valid_values, (0, 1)).all() or not np.isin(solve_valid_values, (0, 1)).all():
+            raise RuntimeError("particle constitutive objective audit validity flags are malformed")
+        force_values = [array_values(array, np.float32) for array in self._particle_constitutive_objective_audit_force]
+        hessian_values = [
+            array_values(array, np.float32) for array in self._particle_constitutive_objective_audit_hessian
+        ]
+        vector_values = [array_values(array, np.float32) for array in (before, proposed, applied)]
+        self._particle_constitutive_objective_audit_last_read_epoch = epoch
+        self._particle_constitutive_objective_audit_capture_active = False
+        return {
+            "schema": "newton-vbd-particle-constitutive-objective-audit-v1",
+            "telemetry_enabled": True,
+            "solver_step_epoch": epoch,
+            "particle_count": int(self.model.particle_count),
+            "particle_color_group_count": len(self.model.particle_color_groups),
+            "iterations": int(self.iterations),
+            "pass_count": int(self._particle_constitutive_objective_audit_pass_count),
+            "snapshot_shape": list(snapshot_values.shape),
+            "snapshots": snapshot_values.tolist(),
+            "row_valid": row_valid_values.tolist(),
+            "solve_valid": solve_valid_values.tolist(),
+            "inertia_force": force_values[0].tolist(),
+            "contact_force": force_values[1].tolist(),
+            "elastic_force": force_values[2].tolist(),
+            "damping_force": force_values[3].tolist(),
+            "total_force": force_values[4].tolist(),
+            "inertia_hessian": hessian_values[0].tolist(),
+            "contact_hessian": hessian_values[1].tolist(),
+            "elastic_hessian": hessian_values[2].tolist(),
+            "damping_hessian": hessian_values[3].tolist(),
+            "total_hessian": hessian_values[4].tolist(),
+            "displacement_before": vector_values[0].tolist(),
+            "proposed_increment": vector_values[1].tolist(),
+            "applied_increment": vector_values[2].tolist(),
+        }
+
     def _reset_particle_sweep_telemetry(self):
         if not self._particle_sweep_telemetry_enabled:
             return
         max_update = self._particle_sweep_max_update
         finite = self._particle_sweep_finite
-        if max_update is None or finite is None or max_update.shape != (int(self.iterations),) or finite.shape != (int(self.iterations),):
+        if (
+            max_update is None
+            or finite is None
+            or max_update.shape != (int(self.iterations),)
+            or finite.shape != (int(self.iterations),)
+        ):
             raise RuntimeError("particle sweep telemetry buffers are malformed")
         if int(self.iterations) == 0:
             return
@@ -2759,6 +3051,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         """
         self._apply_module_options()
         self._advance_positive_j_guard_step_epoch()
+        self._prepare_particle_constitutive_objective_audit(state_in)
         self._reset_particle_sweep_telemetry()
         self._reset_particle_active_set_cycle_telemetry()
         self._reset_positive_j_guard_telemetry()
@@ -2771,6 +3064,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._initialize_rigid_bodies(state_in, control, contacts, dt, update_rigid)
         self._initialize_particles(state_in, state_out, dt)
         self._capture_particle_active_set_cycle_state(state_in.particle_q, 0)
+        self._capture_particle_constitutive_objective_audit_state(state_in.particle_q, 0)
 
         for iter_num in range(self.iterations):
             self._solve_rigid_body_iteration(state_in, state_out, control, contacts, dt)
@@ -3847,6 +4141,11 @@ class SolverVBD(SolverBase, CouplingInterface):
                     device=self.device,
                 )
             self._penetration_free_truncation(state_in.particle_q)
+            self._capture_particle_constitutive_objective_audit_pass(
+                state_in,
+                dt,
+                iter_num * len(self.model.particle_color_groups) + color,
+            )
 
         wp.copy(state_out.particle_q, state_in.particle_q)
 

@@ -125,6 +125,152 @@ def capture_particle_active_set_cycle_state(
     state_matrix[state_ordinal, particle] = particle_q[particle]
 
 
+@wp.kernel
+def capture_particle_constitutive_objective_audit_state(
+    particle_q: wp.array[wp.vec3],
+    snapshots: wp.array2d[wp.vec3],
+    snapshot_ordinal: int,
+):
+    """Capture one complete particle state for the opt-in H5 audit."""
+    particle = wp.tid()
+    snapshots[snapshot_ordinal, particle] = particle_q[particle]
+
+
+@wp.kernel
+def capture_particle_constitutive_objective_audit(
+    dt: float,
+    pass_ordinal: int,
+    particle_count: int,
+    pos_prev: wp.array[wp.vec3],
+    pos: wp.array[wp.vec3],
+    mass: wp.array[float],
+    inertia: wp.array[wp.vec3],
+    particle_flags: wp.array[wp.int32],
+    tet_indices: wp.array2d[wp.int32],
+    tet_poses: wp.array[wp.mat33],
+    tet_materials: wp.array2d[float],
+    particle_adjacency: MeshAdjacencyData,
+    particle_forces: wp.array[wp.vec3],
+    particle_hessians: wp.array[wp.mat33],
+    particle_displacements: wp.array[wp.vec3],
+    snapshots: wp.array2d[wp.vec3],
+    row_valid: wp.array[wp.int32],
+    solve_valid: wp.array[wp.int32],
+    inertia_force: wp.array[wp.vec3],
+    contact_force: wp.array[wp.vec3],
+    elastic_force: wp.array[wp.vec3],
+    damping_force: wp.array[wp.vec3],
+    total_force: wp.array[wp.vec3],
+    inertia_hessian: wp.array[wp.mat33],
+    contact_hessian: wp.array[wp.mat33],
+    elastic_hessian: wp.array[wp.mat33],
+    damping_hessian: wp.array[wp.mat33],
+    total_hessian: wp.array[wp.mat33],
+    displacement_before: wp.array[wp.vec3],
+    proposed_increment: wp.array[wp.vec3],
+    applied_increment: wp.array[wp.vec3],
+):
+    """Capture passive constitutive components after one color pass.
+
+    The evaluator is deliberately a sibling readback path: it recomputes the
+    existing tet contribution and never writes a force, Hessian, displacement,
+    or guard decision used by production VBD.
+    """
+    particle = wp.tid()
+    row = pass_ordinal * particle_count + particle
+    snapshots[pass_ordinal + 1, particle] = pos[particle]
+    row_valid[row] = 0
+    solve_valid[row] = 0
+    zero_force = wp.vec3(0.0)
+    zero_hessian = wp.mat33(0.0)
+    inertia_force[row] = zero_force
+    contact_force[row] = zero_force
+    elastic_force[row] = zero_force
+    damping_force[row] = zero_force
+    total_force[row] = zero_force
+    inertia_hessian[row] = zero_hessian
+    contact_hessian[row] = zero_hessian
+    elastic_hessian[row] = zero_hessian
+    damping_hessian[row] = zero_hessian
+    total_hessian[row] = zero_hessian
+    displacement_before[row] = zero_force
+    proposed_increment[row] = zero_force
+    applied_increment[row] = zero_force
+
+    if not particle_flags[particle] & ParticleFlags.ACTIVE or mass[particle] == 0.0:
+        return
+
+    inv_dt2 = 1.0 / (dt * dt)
+    f_inertia = mass[particle] * (inertia[particle] - pos[particle]) * inv_dt2
+    h_inertia = mass[particle] * inv_dt2 * wp.identity(n=3, dtype=float)
+    f_elastic = wp.vec3(0.0)
+    h_elastic = wp.mat33(0.0)
+    f_no_damping = wp.vec3(0.0)
+    h_no_damping = wp.mat33(0.0)
+    if tet_indices.shape[0] > 0:
+        num_adj_tets = get_vertex_num_adjacent_tets(particle_adjacency, particle)
+        for adj_tet_counter in range(num_adj_tets):
+            tet_id, vertex_order = get_vertex_adjacent_tet_id_order(particle_adjacency, particle, adj_tet_counter)
+            if tet_materials[tet_id, 0] > 0.0 or tet_materials[tet_id, 1] > 0.0:
+                f_full, h_full = evaluate_volumetric_neo_hookean_force_and_hessian(
+                    tet_id,
+                    vertex_order,
+                    pos_prev,
+                    pos,
+                    tet_indices,
+                    tet_poses[tet_id],
+                    tet_materials[tet_id, 0],
+                    tet_materials[tet_id, 1],
+                    tet_materials[tet_id, 2],
+                    dt,
+                )
+                f_rest, h_rest = evaluate_volumetric_neo_hookean_force_and_hessian(
+                    tet_id,
+                    vertex_order,
+                    pos_prev,
+                    pos,
+                    tet_indices,
+                    tet_poses[tet_id],
+                    tet_materials[tet_id, 0],
+                    tet_materials[tet_id, 1],
+                    0.0,
+                    dt,
+                )
+                f_elastic += f_rest
+                h_elastic += h_rest
+                f_no_damping += f_full
+                h_no_damping += h_full
+
+    f_damping = f_no_damping - f_elastic
+    h_damping = h_no_damping - h_elastic
+    f_contact = particle_forces[particle]
+    h_contact = particle_hessians[particle]
+    f_total = f_inertia + f_contact + f_elastic + f_damping
+    h_total = h_inertia + h_contact + h_elastic + h_damping
+    applied = pos[particle] - snapshots[pass_ordinal, particle]
+    proposed = particle_displacements[particle]
+    before = proposed - applied
+    determinant = wp.determinant(h_total)
+    finite = (
+        wp.isfinite(f_total[0]) and wp.isfinite(f_total[1]) and wp.isfinite(f_total[2]) and wp.isfinite(determinant)
+    )
+    row_valid[row] = 1 if finite else 0
+    solve_valid[row] = 1 if finite and wp.abs(determinant) > 1.0e-8 else 0
+    inertia_force[row] = f_inertia
+    contact_force[row] = f_contact
+    elastic_force[row] = f_elastic
+    damping_force[row] = f_damping
+    total_force[row] = f_total
+    inertia_hessian[row] = h_inertia
+    contact_hessian[row] = h_contact
+    elastic_hessian[row] = h_elastic
+    damping_hessian[row] = h_damping
+    total_hessian[row] = h_total
+    displacement_before[row] = before
+    proposed_increment[row] = proposed
+    applied_increment[row] = applied
+
+
 class mat32(wp.types.matrix(shape=(3, 2), dtype=wp.float32)):
     pass
 
@@ -1888,9 +2034,7 @@ def _guard_vbd_displacement_increment(
     if alpha == 0.0:
         # A zero-alpha decision must leave every incident tet exactly unchanged.
         for adjacent_tet in range(get_vertex_num_adjacent_tets(particle_adjacency, particle_index)):
-            tet_index, vertex_order = get_vertex_adjacent_tet_id_order(
-                particle_adjacency, particle_index, adjacent_tet
-            )
+            tet_index, vertex_order = get_vertex_adjacent_tet_id_order(particle_adjacency, particle_index, adjacent_tet)
             i0 = tet_indices[tet_index, 0]
             i1 = tet_indices[tet_index, 1]
             i2 = tet_indices[tet_index, 2]
@@ -1908,9 +2052,7 @@ def _guard_vbd_displacement_increment(
                 final_p2 = final_particle
             else:
                 final_p3 = final_particle
-            final_applied_determinant = wp.dot(
-                wp.cross(final_p1 - final_p0, final_p2 - final_p0), final_p3 - final_p0
-            )
+            final_applied_determinant = wp.dot(wp.cross(final_p1 - final_p0, final_p2 - final_p0), final_p3 - final_p0)
             current_determinant = wp.dot(wp.cross(pos[i1] - pos[i0], pos[i2] - pos[i0]), pos[i3] - pos[i0])
             inverse_rest_determinant = wp.determinant(tet_poses[tet_index])
             rest_determinant = 1.0 / inverse_rest_determinant
@@ -1928,12 +2070,8 @@ def _guard_vbd_displacement_increment(
                 or determinant_floor <= 0.0
                 or final_applied_determinant != current_determinant
                 or final_applied_determinant <= 0.0
-                or (
-                    current_determinant > determinant_floor and final_applied_determinant < determinant_floor
-                )
-                or (
-                    current_determinant <= determinant_floor and final_applied_determinant < current_determinant
-                )
+                or (current_determinant > determinant_floor and final_applied_determinant < determinant_floor)
+                or (current_determinant <= determinant_floor and final_applied_determinant < current_determinant)
             ):
                 postcheck_invalid = 1
 
@@ -1941,9 +2079,7 @@ def _guard_vbd_displacement_increment(
         # Record local reasons with the final decision, while preserving the
         # analytic aggregate and same-tet determinant before the postcheck.
         for adjacent_tet in range(get_vertex_num_adjacent_tets(particle_adjacency, particle_index)):
-            tet_index, vertex_order = get_vertex_adjacent_tet_id_order(
-                particle_adjacency, particle_index, adjacent_tet
-            )
+            tet_index, vertex_order = get_vertex_adjacent_tet_id_order(particle_adjacency, particle_index, adjacent_tet)
             i0 = tet_indices[tet_index, 0]
             i1 = tet_indices[tet_index, 1]
             i2 = tet_indices[tet_index, 2]
@@ -2051,12 +2187,8 @@ def _guard_vbd_displacement_increment(
                 or not wp.isfinite(current_determinant)
                 or applied_determinant != current_determinant
                 or applied_determinant <= 0.0
-                or (
-                    current_determinant > determinant_floor and applied_determinant < determinant_floor
-                )
-                or (
-                    current_determinant <= determinant_floor and applied_determinant < current_determinant
-                )
+                or (current_determinant > determinant_floor and applied_determinant < determinant_floor)
+                or (current_determinant <= determinant_floor and applied_determinant < current_determinant)
             ):
                 finalcheck_invalid = 1
 
@@ -2114,7 +2246,12 @@ def _guard_vbd_displacement_increment(
                     active_set_cycle_reason_counts,
                     active_set_cycle_overflow,
                 )
-            if postcheck_invalid != 0 and local_invalid == 0 and (precheck_invalid != 0 or finalcheck_invalid != 0) and (telemetry_enabled or active_set_cycle_enabled):
+            if (
+                postcheck_invalid != 0
+                and local_invalid == 0
+                and (precheck_invalid != 0 or finalcheck_invalid != 0)
+                and (telemetry_enabled or active_set_cycle_enabled)
+            ):
                 _record_positive_j_guard_event(
                     POSITIVE_J_GUARD_REASON_INVALID_INPUT,
                     site,

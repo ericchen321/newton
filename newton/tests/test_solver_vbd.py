@@ -4319,12 +4319,8 @@ def _test_vbd_positive_j_recovery_policy_and_telemetry(test, device):
     reduced_solver._reset_positive_j_guard_telemetry()
     reduced_solver._apply_guarded_particle_displacements(reduced_state.particle_q)
     reduced_payload = reduced_solver.read_positive_j_guard_telemetry_v2()
-    reduced_records = [
-        record for record in reduced_payload["records"] if record["particle_id"] == 0
-    ]
-    reduced_rejections = [
-        record for record in reduced_records if record["local_reason"] == "applied_postcheck_reject"
-    ]
+    reduced_records = [record for record in reduced_payload["records"] if record["particle_id"] == 0]
+    reduced_rejections = [record for record in reduced_records if record["local_reason"] == "applied_postcheck_reject"]
     test.assertEqual(len(reduced_rejections), 1)
     reduced_witness = reduced_rejections[0]
     test.assertEqual(reduced_witness["aggregate_alpha"], 0.0)
@@ -4414,7 +4410,9 @@ def _test_vbd_positive_j_scope_explicit_telemetry_v2(test, device):
     }
     assert_keys = [set(record) for record in records]
     test.assertTrue(all(keys == record_keys for keys in assert_keys))
-    test.assertEqual(records, sorted(records, key=lambda row: (row["tet_id"], row["local_reason"], row["event_ordinal"])))
+    test.assertEqual(
+        records, sorted(records, key=lambda row: (row["tet_id"], row["local_reason"], row["event_ordinal"]))
+    )
     for record in records:
         test.assertEqual(record["solver_step_epoch"], 1)
         test.assertEqual(record["event_ordinal"], record["pass_ordinal"] * model.particle_count + record["particle_id"])
@@ -4787,7 +4785,7 @@ def _test_vbd_particle_active_set_cycle_telemetry(test, device):
 
     for tile_solve in (False, True) if device.is_cuda else (False,):
         off_output, _before, _observed, off_payload, off_events, _off_solver = run(False, tile_solve)
-        on_output, before, observed, payload, events, solver = run(True, tile_solve)
+        on_output, before, observed, _payload, events, solver = run(True, tile_solve)
         test.assertIsNone(off_payload)
         test.assertIsNone(off_events)
         test.assertTrue(np.array_equal(off_output, on_output))
@@ -4815,6 +4813,66 @@ def _test_vbd_particle_active_set_cycle_telemetry(test, device):
         counts.assign(np.full(counts.shape, events["event_capacity"] + 1, dtype=np.int32))
         with test.assertRaises(OverflowError):
             solver.read_particle_active_set_cycle_events()
+
+
+def _test_vbd_particle_constitutive_objective_audit(test, device):
+    """Verify fixed H5 audit buffers, probe-only reads, and state equivalence."""
+    disabled_model = _round7_coloring_model(device)
+    disabled = newton.solvers.SolverVBD(
+        disabled_model,
+        iterations=1,
+        particle_enable_tile_solve=device.is_cuda,
+        particle_collision_detection_interval=-1,
+    )
+    with test.assertRaises(RuntimeError):
+        disabled.read_particle_constitutive_objective_audit_telemetry()
+    with test.assertRaises(TypeError):
+        newton.solvers.SolverVBD(disabled_model, particle_constitutive_objective_audit=1)
+    with test.assertRaises(TypeError):
+        newton.solvers.SolverVBD(disabled_model, particle_constitutive_objective_audit_probe_epochs=[1])
+    with test.assertRaises(ValueError):
+        newton.solvers.SolverVBD(disabled_model, particle_constitutive_objective_audit_probe_epochs=(1,))
+    with test.assertRaises(ValueError):
+        newton.solvers.SolverVBD(
+            disabled_model,
+            particle_constitutive_objective_audit=True,
+            particle_constitutive_objective_audit_probe_epochs=(2, 1),
+        )
+
+    def run(enabled, tile_solve):
+        model = _round7_coloring_model(device)
+        solver = newton.solvers.SolverVBD(
+            model,
+            iterations=1,
+            particle_enable_tile_solve=tile_solve,
+            particle_collision_detection_interval=-1,
+            particle_constitutive_objective_audit=enabled,
+            particle_constitutive_objective_audit_probe_epochs=(1,) if enabled else (),
+        )
+        state_in, state_out = model.state(), model.state()
+        initial = model.particle_q.numpy().copy()
+        initial[0, 2] = 0.9
+        state_in.particle_q.assign(initial.astype(np.float32))
+        solver.step(state_in, state_out, model.control(clone_variables=False), None, 0.01)
+        payload = solver.read_particle_constitutive_objective_audit_telemetry() if enabled else None
+        return state_out.particle_q.numpy().copy(), payload, solver
+
+    for tile_solve in (False, True) if device.is_cuda else (False,):
+        off_output, off_payload, _off_solver = run(False, tile_solve)
+        on_output, payload, solver = run(True, tile_solve)
+        test.assertIsNone(off_payload)
+        test.assertTrue(np.array_equal(off_output, on_output))
+        test.assertEqual(payload["schema"], "newton-vbd-particle-constitutive-objective-audit-v1")
+        test.assertEqual(payload["pass_count"], 4)
+        test.assertEqual(payload["snapshot_shape"], [5, 4, 3])
+        test.assertEqual(len(payload["row_valid"]), 16)
+        test.assertEqual(len(payload["total_force"]), 16)
+        test.assertEqual(len(payload["total_hessian"]), 16)
+        test.assertTrue(
+            all(np.isfinite(np.asarray(payload[name])).all() for name in ("snapshots", "total_force", "total_hessian"))
+        )
+        with test.assertRaises(RuntimeError):
+            solver.read_particle_constitutive_objective_audit_telemetry()
 
 
 class TestSolverVBD(unittest.TestCase):
@@ -4937,6 +4995,13 @@ add_function_test(
     TestSolverVBD,
     "test_vbd_particle_active_set_cycle_telemetry",
     _test_vbd_particle_active_set_cycle_telemetry,
+    devices=devices,
+)
+
+add_function_test(
+    TestSolverVBD,
+    "test_vbd_particle_constitutive_objective_audit",
+    _test_vbd_particle_constitutive_objective_audit,
     devices=devices,
 )
 
