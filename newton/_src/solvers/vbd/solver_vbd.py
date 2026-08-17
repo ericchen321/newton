@@ -905,7 +905,11 @@ class SolverVBD(SolverBase, CouplingInterface):
         }
         self._positive_j_guard_enabled = bool(self.particle_positive_j_guard_telemetry and model.tet_count > 0)
         self._positive_j_guard_step_epoch = 0
-        telemetry_slots = model.tet_count * POSITIVE_J_GUARD_REASON_COUNT if self._positive_j_guard_enabled else 0
+        telemetry_slots = (
+            3 * POSITIVE_J_GUARD_REASON_COUNT * model.tet_count if self._positive_j_guard_enabled else 0
+        )
+        if telemetry_slots > POSITIVE_J_GUARD_EVENT_ORDINAL_MAX:
+            raise OverflowError("positive-J guard telemetry capacity exceeds int32 range")
         self._positive_j_guard_event_ordinal = wp.full(
             telemetry_slots,
             POSITIVE_J_GUARD_EVENT_ORDINAL_MAX,
@@ -933,6 +937,11 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._positive_j_guard_event_pre_postcheck_applied_determinant = wp.zeros(
             telemetry_slots, dtype=float, device=self.device
         )
+        self._positive_j_guard_event_commit_token = wp.zeros(
+            telemetry_slots, dtype=wp.int32, device=self.device
+        )
+        self._positive_j_guard_generation_counter = wp.zeros(1, dtype=wp.int32, device=self.device)
+        self._positive_j_guard_provenance_failure = wp.zeros(1, dtype=wp.int32, device=self.device)
         self._positive_j_guard_reason_counts = wp.zeros(
             POSITIVE_J_GUARD_REASON_COUNT if self._positive_j_guard_enabled else 0,
             dtype=wp.int32,
@@ -1010,10 +1019,192 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.particle_displacements = wp.zeros(self.model.particle_count, dtype=wp.vec3, device=self.device)
         self.truncation_ts = wp.zeros(self.model.particle_count, dtype=float, device=self.device)
 
+    def read_positive_j_guard_telemetry_v3(self):
+        """Validate and return coherent positive-J representative records."""
+        if not self._positive_j_guard_enabled:
+            return None
+        tet_count = int(self.model.tet_count)
+        particle_count = int(self.model.particle_count)
+        capacity = 3 * POSITIVE_J_GUARD_REASON_COUNT * tet_count
+        arrays = {
+            "event_ordinal": self._positive_j_guard_event_ordinal,
+            "event_solver_step_epoch": self._positive_j_guard_event_solver_step_epoch,
+            "event_pass_ordinal": self._positive_j_guard_event_pass_ordinal,
+            "event_site": self._positive_j_guard_event_site,
+            "event_particle_id": self._positive_j_guard_event_particle_id,
+            "event_tet_id": self._positive_j_guard_event_tet_id,
+            "event_current_determinant": self._positive_j_guard_event_current_determinant,
+            "event_floor": self._positive_j_guard_event_floor,
+            "event_proposed_determinant": self._positive_j_guard_event_proposed_determinant,
+            "event_alpha": self._positive_j_guard_event_alpha,
+            "event_decision": self._positive_j_guard_event_decision,
+            "event_nonlegacy_alpha": self._positive_j_guard_event_nonlegacy_alpha,
+            "event_applied_determinant": self._positive_j_guard_event_applied_determinant,
+            "event_pre_postcheck_aggregate_alpha": self._positive_j_guard_event_pre_postcheck_aggregate_alpha,
+            "event_pre_postcheck_nonlegacy_alpha": self._positive_j_guard_event_pre_postcheck_nonlegacy_alpha,
+            "event_pre_postcheck_applied_determinant": self._positive_j_guard_event_pre_postcheck_applied_determinant,
+            "event_commit_token": self._positive_j_guard_event_commit_token,
+        }
+        for name, array in arrays.items():
+            if array is None or tuple(array.shape) != (capacity,):
+                raise RuntimeError(f"positive-J guard v3 {name} buffer shape differs")
+        failure = self._to_numpy(self._positive_j_guard_provenance_failure, dtype=np.int32).reshape(-1)
+        generation = self._to_numpy(self._positive_j_guard_generation_counter, dtype=np.int64).reshape(-1)
+        if failure.shape != (1,) or generation.shape != (1,) or int(failure[0]) != 0:
+            raise RuntimeError("positive-J guard telemetry provenance failure or metadata is set")
+        values = {name: self._to_numpy(array).reshape(-1) for name, array in arrays.items()}
+        tokens = np.asarray(values["event_commit_token"], dtype=np.int64)
+        sites = np.asarray(values["event_site"], dtype=np.int64)
+        ordinals = np.asarray(values["event_ordinal"], dtype=np.int64)
+        epochs = np.asarray(values["event_solver_step_epoch"], dtype=np.int64)
+        passes = np.asarray(values["event_pass_ordinal"], dtype=np.int64)
+        particles = np.asarray(values["event_particle_id"], dtype=np.int64)
+        tets = np.asarray(values["event_tet_id"], dtype=np.int64)
+        decisions = np.asarray(values["event_decision"], dtype=np.int64)
+        float_names = (
+            "event_current_determinant",
+            "event_floor",
+            "event_proposed_determinant",
+            "event_alpha",
+            "event_nonlegacy_alpha",
+            "event_applied_determinant",
+            "event_pre_postcheck_aggregate_alpha",
+            "event_pre_postcheck_nonlegacy_alpha",
+            "event_pre_postcheck_applied_determinant",
+        )
+        float32_values = {name: np.asarray(values[name], dtype=np.float32) for name in float_names}
+        float_bits = {name: float32_values[name].view(np.uint32) for name in float_names}
+        used_tokens = set()
+        records = []
+        for slot in range(capacity):
+            site = int(sites[slot])
+            token = int(tokens[slot])
+            ordinal = int(ordinals[slot])
+            if site == -2:
+                raise RuntimeError(f"positive-J guard v3 slot {slot} is still locked")
+            if site == -1:
+                if token != 0 or ordinal != POSITIVE_J_GUARD_EVENT_ORDINAL_MAX:
+                    raise RuntimeError(f"positive-J guard v3 empty slot {slot} is malformed")
+                continue
+            if site not in self._positive_j_guard_site_names or token <= 0:
+                raise RuntimeError(f"positive-J guard v3 slot {slot} key/token is malformed")
+            if token in used_tokens:
+                raise RuntimeError(f"positive-J guard v3 duplicate commit token {token}")
+            used_tokens.add(token)
+            reason_index = (slot // tet_count) % POSITIVE_J_GUARD_REASON_COUNT
+            tet_id = slot % tet_count
+            epoch = int(epochs[slot])
+            pass_ordinal = int(passes[slot])
+            particle_id = int(particles[slot])
+            if (
+                ordinal < 0
+                or ordinal >= POSITIVE_J_GUARD_EVENT_ORDINAL_MAX
+                or epoch != self._positive_j_guard_step_epoch
+                or pass_ordinal < 0
+                or particle_id < 0
+                or particle_id >= particle_count
+                or int(tets[slot]) != tet_id
+                or ordinal != pass_ordinal * particle_count + particle_id
+                or int(decisions[slot]) not in (0, 1)
+            ):
+                raise RuntimeError(
+                    f"positive-J guard v3 slot {slot} identity is malformed: "
+                    f"ordinal={ordinal} epoch={epoch} expected_epoch={self._positive_j_guard_step_epoch} "
+                    f"pass={pass_ordinal} particle={particle_id} tet={int(tets[slot])} "
+                    f"decision={int(decisions[slot])} token={token}"
+                )
+            if any(not np.isfinite(float32_values[name][slot]) for name in float_names):
+                raise RuntimeError(f"positive-J guard v3 slot {slot} contains nonfinite float data")
+            records.append(
+                {
+                    "slot": slot,
+                    "commit_token": token,
+                    "solver_step_epoch": epoch,
+                    "pass_ordinal": pass_ordinal,
+                    "event_ordinal": ordinal,
+                    "site": self._positive_j_guard_site_names[site],
+                    "particle_id": particle_id,
+                    "tet_id": tet_id,
+                    "local_reason": self._positive_j_guard_reason_names[reason_index],
+                    "aggregate_decision": bool(decisions[slot]),
+                    **{
+                        name.removeprefix("event_") + "_bits": int(float_bits[name][slot])
+                        for name in float_names
+                    },
+                }
+            )
+        if used_tokens and int(generation[0]) < max(used_tokens):
+            raise RuntimeError("positive-J guard v3 generation counter regressed")
+        reason_counts = self._to_numpy(self._positive_j_guard_reason_counts, dtype=np.int64).reshape(-1)
+        if reason_counts.shape != (POSITIVE_J_GUARD_REASON_COUNT,) or np.any(reason_counts < 0):
+            raise RuntimeError("positive-J guard v3 reason counts are malformed")
+        representatives = [0] * POSITIVE_J_GUARD_REASON_COUNT
+        for record in records:
+            representatives[self._positive_j_guard_reason_names.index(record["local_reason"])] += 1
+        if any(
+            int(count) > 0 and representative == 0
+            for count, representative in zip(reason_counts, representatives)
+        ):
+            raise RuntimeError("positive-J guard v3 has a nonzero count without a representative")
+        records.sort(key=lambda record: (record["tet_id"], record["local_reason"], record["event_ordinal"]))
+        return {
+            "schema": "newton-vbd-positive-j-guard-telemetry-v3",
+            "version": 3,
+            "policy": self.particle_positive_j_guard_policy,
+            "telemetry_enabled": True,
+            "solver_step_epoch": int(self._positive_j_guard_step_epoch),
+            "particle_count": particle_count,
+            "tet_count": tet_count,
+            "capacity": capacity,
+            "committed_count": len(records),
+            "overflow": False,
+            "provenance_failure": False,
+            "reason_counts": {
+                reason: int(reason_counts[index]) for index, reason in enumerate(self._positive_j_guard_reason_names)
+            },
+            "source_stages": {
+                "current_determinant": "current_snapshot",
+                "proposed_determinant": "local_proposal",
+                "aggregate_alpha": "final_guard_decision",
+                "applied_determinant": "final_guard_decision",
+            },
+            "records": records,
+        }
+
     def read_positive_j_guard_telemetry(self):
         """Return the current narrow positive-J guard telemetry as JSON-safe data."""
         if not self._positive_j_guard_enabled:
             return None
+
+        v3 = self.read_positive_j_guard_telemetry_v3()
+        def scalar(record, key):
+            return float(np.asarray([record[key + "_bits"]], dtype=np.uint32).view(np.float32)[0])
+        records = []
+        for record in v3["records"]:
+            records.append(
+                {
+                    "event_ordinal": record["event_ordinal"],
+                    "site": record["site"],
+                    "particle_id": record["particle_id"],
+                    "tet_id": record["tet_id"],
+                    "reason": record["local_reason"],
+                    "current_determinant_m3": scalar(record, "current_determinant"),
+                    "determinant_floor_m3": scalar(record, "floor"),
+                    "proposed_determinant_m3": scalar(record, "proposed_determinant"),
+                    "alpha": scalar(record, "alpha"),
+                    "decision": bool(record["aggregate_decision"]),
+                    "nonlegacy_alpha": scalar(record, "nonlegacy_alpha"),
+                }
+            )
+        records.sort(key=lambda record: (record["tet_id"], record["reason"], record["event_ordinal"]))
+        return {
+            "schema": "newton-vbd-positive-j-guard-telemetry-v1",
+            "policy": self.particle_positive_j_guard_policy,
+            "telemetry_enabled": True,
+            "reason_counts": v3["reason_counts"],
+            "record_count": len(records),
+            "records": records,
+        }
 
         ordinals = self._to_numpy(self._positive_j_guard_event_ordinal, dtype=np.int64)
         sites = self._to_numpy(self._positive_j_guard_event_site, dtype=np.int32)
@@ -1067,6 +1258,54 @@ class SolverVBD(SolverBase, CouplingInterface):
         """Return scope-explicit positive-J guard telemetry for the current step."""
         if not self._positive_j_guard_enabled:
             return None
+
+        v3 = self.read_positive_j_guard_telemetry_v3()
+        particle_count = int(self.model.particle_count)
+        def scalar(record, key):
+            return float(np.asarray([record[key + "_bits"]], dtype=np.uint32).view(np.float32)[0])
+        records = []
+        for record in v3["records"]:
+            records.append(
+                {
+                    "solver_step_epoch": record["solver_step_epoch"],
+                    "pass_ordinal": record["pass_ordinal"],
+                    "event_ordinal": record["event_ordinal"],
+                    "site": record["site"],
+                    "particle_id": record["particle_id"],
+                    "tet_id": record["tet_id"],
+                    "local_reason": record["local_reason"],
+                    "local_current_determinant_m3": scalar(record, "current_determinant"),
+                    "local_determinant_floor_m3": scalar(record, "floor"),
+                    "local_unscaled_proposed_determinant_m3": scalar(record, "proposed_determinant"),
+                    "aggregate_alpha": scalar(record, "alpha"),
+                    "aggregate_decision": record["aggregate_decision"],
+                    "aggregate_nonlegacy_alpha": scalar(record, "nonlegacy_alpha"),
+                    "applied_determinant_m3": scalar(record, "applied_determinant"),
+                    "pre_postcheck_aggregate_alpha": scalar(record, "pre_postcheck_aggregate_alpha"),
+                    "pre_postcheck_nonlegacy_alpha": scalar(record, "pre_postcheck_nonlegacy_alpha"),
+                    "pre_postcheck_applied_determinant_m3": scalar(record, "pre_postcheck_applied_determinant"),
+                }
+            )
+        return {
+            "schema": "newton-vbd-positive-j-guard-telemetry-v2",
+            "policy": self.particle_positive_j_guard_policy,
+            "telemetry_enabled": True,
+            "solver_step_epoch": v3["solver_step_epoch"],
+            "particle_count": particle_count,
+            "particle_color_group_count": len(self.model.particle_color_groups),
+            "iterations": int(self.iterations),
+            "field_scopes": {
+                "local": "one_incident_tet_unscaled_candidate",
+                "aggregate": "one_particle_final_guard_decision",
+                "applied": "same_incident_tet_after_aggregate_alpha",
+                "pre_postcheck_aggregate": "one_particle_analytic_guard_decision_before_applied_postcheck",
+                "pre_postcheck_nonlegacy": "one_particle_analytic_nonlegacy_guard_decision_before_applied_postcheck",
+                "pre_postcheck_applied": "same_incident_tet_after_analytic_aggregate_alpha_before_applied_postcheck",
+            },
+            "reason_counts": v3["reason_counts"],
+            "record_count": len(records),
+            "records": records,
+        }
 
         step_epoch = self._positive_j_guard_step_epoch
         if type(step_epoch) is not int or not 0 <= step_epoch <= POSITIVE_J_GUARD_EVENT_ORDINAL_MAX:
@@ -1939,6 +2178,9 @@ class SolverVBD(SolverBase, CouplingInterface):
                 self._positive_j_guard_event_pre_postcheck_aggregate_alpha,
                 self._positive_j_guard_event_pre_postcheck_nonlegacy_alpha,
                 self._positive_j_guard_event_pre_postcheck_applied_determinant,
+                self._positive_j_guard_event_commit_token,
+                self._positive_j_guard_generation_counter,
+                self._positive_j_guard_provenance_failure,
                 self._positive_j_guard_reason_counts,
             ],
             device=self.device,
@@ -3682,6 +3924,9 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self._positive_j_guard_event_pre_postcheck_aggregate_alpha,
                     self._positive_j_guard_event_pre_postcheck_nonlegacy_alpha,
                     self._positive_j_guard_event_pre_postcheck_applied_determinant,
+                    self._positive_j_guard_event_commit_token,
+                    self._positive_j_guard_generation_counter,
+                    self._positive_j_guard_provenance_failure,
                     self._positive_j_guard_reason_counts,
                     *self._particle_active_set_cycle_kernel_inputs(),
                     *self._h5_guard_ledger_kernel_inputs(),
@@ -4342,6 +4587,9 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self._positive_j_guard_event_pre_postcheck_aggregate_alpha,
                         self._positive_j_guard_event_pre_postcheck_nonlegacy_alpha,
                         self._positive_j_guard_event_pre_postcheck_applied_determinant,
+                        self._positive_j_guard_event_commit_token,
+                        self._positive_j_guard_generation_counter,
+                        self._positive_j_guard_provenance_failure,
                         self._positive_j_guard_reason_counts,
                         *self._particle_active_set_cycle_kernel_inputs(),
                         *self._h5_guard_ledger_kernel_inputs(),
@@ -4401,6 +4649,9 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self._positive_j_guard_event_pre_postcheck_aggregate_alpha,
                         self._positive_j_guard_event_pre_postcheck_nonlegacy_alpha,
                         self._positive_j_guard_event_pre_postcheck_applied_determinant,
+                        self._positive_j_guard_event_commit_token,
+                        self._positive_j_guard_generation_counter,
+                        self._positive_j_guard_provenance_failure,
                         self._positive_j_guard_reason_counts,
                         *self._particle_active_set_cycle_kernel_inputs(),
                         *self._h5_guard_ledger_kernel_inputs(),

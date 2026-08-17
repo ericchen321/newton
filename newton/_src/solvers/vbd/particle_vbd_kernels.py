@@ -67,6 +67,12 @@ POSITIVE_J_GUARD_SITE_INITIALIZER = 0
 POSITIVE_J_GUARD_SITE_TILE = 1
 POSITIVE_J_GUARD_SITE_SCALAR = 2
 POSITIVE_J_GUARD_EVENT_ORDINAL_MAX = 2**31 - 1
+# A committed slot publishes its site (0..2).  ``-1`` is the empty
+# sentinel and ``-2`` is the short-lived writer lock.  Keeping the lock in
+# the key field means all fields are published as one coherent record even
+# when two colored paths report the same incident tet concurrently.
+POSITIVE_J_GUARD_EVENT_SITE_EMPTY = -1
+POSITIVE_J_GUARD_EVENT_SITE_LOCKED = -2
 PARTICLE_ACTIVE_SET_CYCLE_REASON_COUNT = POSITIVE_J_GUARD_REASON_COUNT
 H5_GUARD_LEDGER_REASON_COUNT = POSITIVE_J_GUARD_REASON_COUNT
 
@@ -1747,6 +1753,9 @@ def reset_positive_j_guard_telemetry(
     event_pre_postcheck_aggregate_alpha: wp.array[float],
     event_pre_postcheck_nonlegacy_alpha: wp.array[float],
     event_pre_postcheck_applied_determinant: wp.array[float],
+    event_commit_token: wp.array[wp.int32],
+    generation_counter: wp.array[wp.int32],
+    provenance_failure: wp.array[wp.int32],
     reason_counts: wp.array[wp.int32],
 ):
     slot = wp.tid()
@@ -1754,7 +1763,7 @@ def reset_positive_j_guard_telemetry(
         event_ordinal[slot] = POSITIVE_J_GUARD_EVENT_ORDINAL_MAX
         event_solver_step_epoch[slot] = -1
         event_pass_ordinal[slot] = -1
-        event_site[slot] = -1
+        event_site[slot] = POSITIVE_J_GUARD_EVENT_SITE_EMPTY
         event_particle_id[slot] = -1
         event_tet_id[slot] = -1
         event_current_determinant[slot] = 0.0
@@ -1767,6 +1776,10 @@ def reset_positive_j_guard_telemetry(
         event_pre_postcheck_aggregate_alpha[slot] = 0.0
         event_pre_postcheck_nonlegacy_alpha[slot] = 0.0
         event_pre_postcheck_applied_determinant[slot] = 0.0
+        event_commit_token[slot] = 0
+    if slot == 0:
+        generation_counter[0] = 0
+        provenance_failure[0] = 0
     if slot < POSITIVE_J_GUARD_REASON_COUNT:
         reason_counts[slot] = 0
 
@@ -1789,6 +1802,7 @@ def _record_positive_j_guard_event(
     solver_step_epoch: int,
     pass_ordinal: int,
     particle_count: int,
+    tet_count: int,
     event_ordinal: wp.array[wp.int32],
     event_solver_step_epoch: wp.array[wp.int32],
     event_pass_ordinal: wp.array[wp.int32],
@@ -1805,6 +1819,9 @@ def _record_positive_j_guard_event(
     event_pre_postcheck_aggregate_alpha: wp.array[float],
     event_pre_postcheck_nonlegacy_alpha: wp.array[float],
     event_pre_postcheck_applied_determinant: wp.array[float],
+    event_commit_token: wp.array[wp.int32],
+    generation_counter: wp.array[wp.int32],
+    provenance_failure: wp.array[wp.int32],
     reason_counts: wp.array[wp.int32],
     h5_ledger_enabled: bool,
     h5_ledger_capacity: int,
@@ -1831,11 +1848,34 @@ def _record_positive_j_guard_event(
 ):
     if event_ordinal.shape[0] == 0:
         return
-    slot = tet_index * POSITIVE_J_GUARD_REASON_COUNT + reason
+    if site < 0 or site >= 3 or reason < 0 or reason >= POSITIVE_J_GUARD_REASON_COUNT or tet_index < 0 or tet_index >= tet_count:
+        wp.atomic_min(provenance_failure, 0, wp.int32(1))
+        return
+    slot = (site * POSITIVE_J_GUARD_REASON_COUNT + reason) * tet_count + tet_index
     ordinal = pass_ordinal * particle_count + particle_index
-    previous = wp.atomic_min(event_ordinal, slot, ordinal)
+    acquired = False
+    previous_site = POSITIVE_J_GUARD_EVENT_SITE_EMPTY
+    # The guard is called from colored launches, but initializer and tile/
+    # scalar paths can still overlap on a shared representative.  A bounded
+    # CAS loop is preferable to publishing a torn record; failure is surfaced
+    # in the packet instead of silently inventing provenance.
+    for _ in range(16):
+        if not acquired:
+            observed_site = event_site[slot]
+            if observed_site != POSITIVE_J_GUARD_EVENT_SITE_LOCKED:
+                previous_site = observed_site
+                if wp.atomic_cas(event_site, slot, observed_site, POSITIVE_J_GUARD_EVENT_SITE_LOCKED) == observed_site:
+                    acquired = True
+    if not acquired:
+        wp.atomic_min(provenance_failure, 0, wp.int32(1))
+        wp.atomic_add(reason_counts, reason, 1)
+        return
+    previous = event_ordinal[slot]
     if previous > ordinal:
-        event_site[slot] = site
+        # Invalidate before replacement so a reader can never accept the old
+        # token while any field is being changed.
+        event_commit_token[slot] = 0
+        event_ordinal[slot] = ordinal
         event_solver_step_epoch[slot] = solver_step_epoch
         event_pass_ordinal[slot] = pass_ordinal
         event_particle_id[slot] = particle_index
@@ -1850,6 +1890,14 @@ def _record_positive_j_guard_event(
         event_pre_postcheck_aggregate_alpha[slot] = pre_postcheck_aggregate_alpha
         event_pre_postcheck_nonlegacy_alpha[slot] = pre_postcheck_nonlegacy_alpha
         event_pre_postcheck_applied_determinant[slot] = pre_postcheck_applied_determinant
+        generation = wp.atomic_add(generation_counter, 0, wp.int32(1)) + 1
+        if generation <= 0:
+            wp.atomic_min(provenance_failure, 0, wp.int32(1))
+        else:
+            event_commit_token[slot] = generation
+            event_site[slot] = site
+    else:
+        event_site[slot] = previous_site
     wp.atomic_add(reason_counts, reason, 1)
     if h5_ledger_enabled and h5_ledger_capacity > 0:
         append_ordinal = wp.atomic_add(h5_ledger_event_count, 0, 1)
@@ -1914,7 +1962,7 @@ def _record_particle_active_set_cycle_event(
 
 
 @wp.func
-def _guard_vbd_displacement_increment(
+def _guard_vbd_displacement_increment_extended(
     particle_index: wp.int32,
     pos: wp.array[wp.vec3],
     displacement_before: wp.vec3,
@@ -1944,6 +1992,9 @@ def _guard_vbd_displacement_increment(
     event_pre_postcheck_aggregate_alpha: wp.array[float],
     event_pre_postcheck_nonlegacy_alpha: wp.array[float],
     event_pre_postcheck_applied_determinant: wp.array[float],
+    event_commit_token: wp.array[wp.int32],
+    generation_counter: wp.array[wp.int32],
+    provenance_failure: wp.array[wp.int32],
     reason_counts: wp.array[wp.int32],
     active_set_cycle_enabled: bool,
     active_set_cycle_event_capacity: int,
@@ -2293,6 +2344,7 @@ def _guard_vbd_displacement_increment(
                     solver_step_epoch,
                     pass_ordinal,
                     particle_count,
+                    tet_indices.shape[0],
                     event_ordinal,
                     event_solver_step_epoch,
                     event_pass_ordinal,
@@ -2309,6 +2361,9 @@ def _guard_vbd_displacement_increment(
                     event_pre_postcheck_aggregate_alpha,
                     event_pre_postcheck_nonlegacy_alpha,
                     event_pre_postcheck_applied_determinant,
+                    event_commit_token,
+                    generation_counter,
+                    provenance_failure,
                     reason_counts,
                     h5_ledger_enabled,
                     h5_ledger_capacity,
@@ -2374,6 +2429,7 @@ def _guard_vbd_displacement_increment(
                     solver_step_epoch,
                     pass_ordinal,
                     particle_count,
+                    tet_indices.shape[0],
                     event_ordinal,
                     event_solver_step_epoch,
                     event_pass_ordinal,
@@ -2390,6 +2446,9 @@ def _guard_vbd_displacement_increment(
                     event_pre_postcheck_aggregate_alpha,
                     event_pre_postcheck_nonlegacy_alpha,
                     event_pre_postcheck_applied_determinant,
+                    event_commit_token,
+                    generation_counter,
+                    provenance_failure,
                     reason_counts,
                     h5_ledger_enabled,
                     h5_ledger_capacity,
@@ -2450,6 +2509,7 @@ def _guard_vbd_displacement_increment(
                     solver_step_epoch,
                     pass_ordinal,
                     particle_count,
+                    tet_indices.shape[0],
                     event_ordinal,
                     event_solver_step_epoch,
                     event_pass_ordinal,
@@ -2466,6 +2526,9 @@ def _guard_vbd_displacement_increment(
                     event_pre_postcheck_aggregate_alpha,
                     event_pre_postcheck_nonlegacy_alpha,
                     event_pre_postcheck_applied_determinant,
+                    event_commit_token,
+                    generation_counter,
+                    provenance_failure,
                     reason_counts,
                     h5_ledger_enabled,
                     h5_ledger_capacity,
@@ -2516,6 +2579,215 @@ def _guard_vbd_displacement_increment(
     return displacement_before + alpha * delta
 
 
+@wp.func
+def _guard_vbd_displacement_increment(
+    particle_index: wp.int32,
+    pos: wp.array[wp.vec3],
+    displacement_before: wp.vec3,
+    displacement_after: wp.vec3,
+    tet_indices: wp.array2d[wp.int32],
+    tet_poses: wp.array[wp.mat33],
+    particle_adjacency: MeshAdjacencyData,
+    policy_code: int,
+    telemetry_enabled: bool,
+    solver_step_epoch: int,
+    pass_ordinal: int,
+    particle_count: int,
+    site: int,
+    event_ordinal: wp.array[wp.int32],
+    event_solver_step_epoch: wp.array[wp.int32],
+    event_pass_ordinal: wp.array[wp.int32],
+    event_site: wp.array[wp.int32],
+    event_particle_id: wp.array[wp.int32],
+    event_tet_id: wp.array[wp.int32],
+    event_current_determinant: wp.array[float],
+    event_floor: wp.array[float],
+    event_proposed_determinant: wp.array[float],
+    event_alpha: wp.array[float],
+    event_decision: wp.array[wp.int32],
+    event_nonlegacy_alpha: wp.array[float],
+    event_applied_determinant: wp.array[float],
+    event_pre_postcheck_aggregate_alpha: wp.array[float],
+    event_pre_postcheck_nonlegacy_alpha: wp.array[float],
+    event_pre_postcheck_applied_determinant: wp.array[float],
+    reason_counts: wp.array[wp.int32],
+):
+    """Compatibility wrapper for direct guard fixtures predating v3."""
+    return _guard_vbd_displacement_increment_extended(
+        particle_index,
+        pos,
+        displacement_before,
+        displacement_after,
+        tet_indices,
+        tet_poses,
+        particle_adjacency,
+        policy_code,
+        telemetry_enabled,
+        solver_step_epoch,
+        pass_ordinal,
+        particle_count,
+        site,
+        event_ordinal,
+        event_solver_step_epoch,
+        event_pass_ordinal,
+        event_site,
+        event_particle_id,
+        event_tet_id,
+        event_current_determinant,
+        event_floor,
+        event_proposed_determinant,
+        event_alpha,
+        event_decision,
+        event_nonlegacy_alpha,
+        event_applied_determinant,
+        event_pre_postcheck_aggregate_alpha,
+        event_pre_postcheck_nonlegacy_alpha,
+        event_pre_postcheck_applied_determinant,
+        event_ordinal,
+        event_ordinal,
+        event_ordinal,
+        reason_counts,
+        False,
+        0,
+        event_ordinal,
+        event_tet_id,
+        event_particle_id,
+        event_site,
+        event_decision,
+        event_pass_ordinal,
+        reason_counts,
+        event_solver_step_epoch,
+        False,
+        0,
+        event_ordinal,
+        event_solver_step_epoch,
+        event_solver_step_epoch,
+        event_pass_ordinal,
+        event_site,
+        event_particle_id,
+        event_tet_id,
+        event_site,
+        event_decision,
+        event_current_determinant,
+        event_floor,
+        event_proposed_determinant,
+        event_alpha,
+        event_nonlegacy_alpha,
+        event_applied_determinant,
+        event_pre_postcheck_aggregate_alpha,
+        event_pre_postcheck_nonlegacy_alpha,
+        event_pre_postcheck_applied_determinant,
+        event_ordinal,
+        reason_counts,
+    )
+
+
+@wp.func
+def _guard_vbd_displacement_increment_full(
+    particle_index: wp.int32,
+    pos: wp.array[wp.vec3],
+    displacement_before: wp.vec3,
+    displacement_after: wp.vec3,
+    tet_indices: wp.array2d[wp.int32],
+    tet_poses: wp.array[wp.mat33],
+    particle_adjacency: MeshAdjacencyData,
+    policy_code: int,
+    telemetry_enabled: bool,
+    solver_step_epoch: int,
+    pass_ordinal: int,
+    particle_count: int,
+    site: int,
+    event_ordinal: wp.array[wp.int32],
+    event_solver_step_epoch: wp.array[wp.int32],
+    event_pass_ordinal: wp.array[wp.int32],
+    event_site: wp.array[wp.int32],
+    event_particle_id: wp.array[wp.int32],
+    event_tet_id: wp.array[wp.int32],
+    event_current_determinant: wp.array[float],
+    event_floor: wp.array[float],
+    event_proposed_determinant: wp.array[float],
+    event_alpha: wp.array[float],
+    event_decision: wp.array[wp.int32],
+    event_nonlegacy_alpha: wp.array[float],
+    event_applied_determinant: wp.array[float],
+    event_pre_postcheck_aggregate_alpha: wp.array[float],
+    event_pre_postcheck_nonlegacy_alpha: wp.array[float],
+    event_pre_postcheck_applied_determinant: wp.array[float],
+    event_commit_token: wp.array[wp.int32],
+    generation_counter: wp.array[wp.int32],
+    provenance_failure: wp.array[wp.int32],
+    reason_counts: wp.array[wp.int32],
+):
+    """Run the guard with coherent telemetry and inert optional ledgers."""
+    return _guard_vbd_displacement_increment_extended(
+        particle_index,
+        pos,
+        displacement_before,
+        displacement_after,
+        tet_indices,
+        tet_poses,
+        particle_adjacency,
+        policy_code,
+        telemetry_enabled,
+        solver_step_epoch,
+        pass_ordinal,
+        particle_count,
+        site,
+        event_ordinal,
+        event_solver_step_epoch,
+        event_pass_ordinal,
+        event_site,
+        event_particle_id,
+        event_tet_id,
+        event_current_determinant,
+        event_floor,
+        event_proposed_determinant,
+        event_alpha,
+        event_decision,
+        event_nonlegacy_alpha,
+        event_applied_determinant,
+        event_pre_postcheck_aggregate_alpha,
+        event_pre_postcheck_nonlegacy_alpha,
+        event_pre_postcheck_applied_determinant,
+        event_commit_token,
+        generation_counter,
+        provenance_failure,
+        reason_counts,
+        False,
+        0,
+        event_ordinal,
+        event_tet_id,
+        event_particle_id,
+        event_site,
+        event_decision,
+        event_pass_ordinal,
+        reason_counts,
+        event_solver_step_epoch,
+        False,
+        0,
+        event_ordinal,
+        event_solver_step_epoch,
+        event_solver_step_epoch,
+        event_pass_ordinal,
+        event_site,
+        event_particle_id,
+        event_tet_id,
+        event_site,
+        event_decision,
+        event_current_determinant,
+        event_floor,
+        event_proposed_determinant,
+        event_alpha,
+        event_nonlegacy_alpha,
+        event_applied_determinant,
+        event_pre_postcheck_aggregate_alpha,
+        event_pre_postcheck_nonlegacy_alpha,
+        event_pre_postcheck_applied_determinant,
+        event_ordinal,
+        reason_counts,
+    )
+
+
 @wp.kernel
 def apply_guarded_particle_displacements(
     particle_ids_in_color: wp.array[wp.int32],
@@ -2545,6 +2817,9 @@ def apply_guarded_particle_displacements(
     event_pre_postcheck_aggregate_alpha: wp.array[float],
     event_pre_postcheck_nonlegacy_alpha: wp.array[float],
     event_pre_postcheck_applied_determinant: wp.array[float],
+    event_commit_token: wp.array[wp.int32],
+    generation_counter: wp.array[wp.int32],
+    provenance_failure: wp.array[wp.int32],
     reason_counts: wp.array[wp.int32],
     active_set_cycle_enabled: bool,
     active_set_cycle_event_capacity: int,
@@ -2584,7 +2859,7 @@ def apply_guarded_particle_displacements(
     particle_index = particle_ids_in_color[wp.tid()]
     displacement_before = wp.vec3(0.0)
     displacement_after = particle_displacements[particle_index]
-    guarded_displacement = _guard_vbd_displacement_increment(
+    guarded_displacement = _guard_vbd_displacement_increment_extended(
         particle_index,
         pos,
         displacement_before,
@@ -2614,6 +2889,9 @@ def apply_guarded_particle_displacements(
         event_pre_postcheck_aggregate_alpha,
         event_pre_postcheck_nonlegacy_alpha,
         event_pre_postcheck_applied_determinant,
+        event_commit_token,
+        generation_counter,
+        provenance_failure,
         reason_counts,
         active_set_cycle_enabled,
         active_set_cycle_event_capacity,
@@ -3633,6 +3911,9 @@ def solve_elasticity_tile(
     event_pre_postcheck_aggregate_alpha: wp.array[float],
     event_pre_postcheck_nonlegacy_alpha: wp.array[float],
     event_pre_postcheck_applied_determinant: wp.array[float],
+    event_commit_token: wp.array[wp.int32],
+    generation_counter: wp.array[wp.int32],
+    provenance_failure: wp.array[wp.int32],
     reason_counts: wp.array[wp.int32],
     active_set_cycle_enabled: bool,
     active_set_cycle_event_capacity: int,
@@ -3806,7 +4087,7 @@ def solve_elasticity_tile(
             )
             displacement_before = particle_displacements[particle_index]
             displacement_after = displacement_before + h_inv * f_total
-            particle_displacements[particle_index] = _guard_vbd_displacement_increment(
+            particle_displacements[particle_index] = _guard_vbd_displacement_increment_extended(
                 particle_index,
                 pos,
                 displacement_before,
@@ -3836,6 +4117,9 @@ def solve_elasticity_tile(
                 event_pre_postcheck_aggregate_alpha,
                 event_pre_postcheck_nonlegacy_alpha,
                 event_pre_postcheck_applied_determinant,
+                event_commit_token,
+                generation_counter,
+                provenance_failure,
                 reason_counts,
                 active_set_cycle_enabled,
                 active_set_cycle_event_capacity,
@@ -3917,6 +4201,9 @@ def solve_elasticity(
     event_pre_postcheck_aggregate_alpha: wp.array[float],
     event_pre_postcheck_nonlegacy_alpha: wp.array[float],
     event_pre_postcheck_applied_determinant: wp.array[float],
+    event_commit_token: wp.array[wp.int32],
+    generation_counter: wp.array[wp.int32],
+    provenance_failure: wp.array[wp.int32],
     reason_counts: wp.array[wp.int32],
     active_set_cycle_enabled: bool,
     active_set_cycle_event_capacity: int,
@@ -4067,7 +4354,7 @@ def solve_elasticity(
         h_inv = wp.inverse(h)
         displacement_before = particle_displacements[particle_index]
         displacement_after = displacement_before + h_inv * f
-        particle_displacements[particle_index] = _guard_vbd_displacement_increment(
+        particle_displacements[particle_index] = _guard_vbd_displacement_increment_extended(
             particle_index,
             pos,
             displacement_before,
@@ -4097,6 +4384,9 @@ def solve_elasticity(
             event_pre_postcheck_aggregate_alpha,
             event_pre_postcheck_nonlegacy_alpha,
             event_pre_postcheck_applied_determinant,
+            event_commit_token,
+            generation_counter,
+            provenance_failure,
             reason_counts,
             active_set_cycle_enabled,
             active_set_cycle_event_capacity,

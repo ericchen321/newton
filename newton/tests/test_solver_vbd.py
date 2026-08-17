@@ -12,7 +12,7 @@ import warp as wp
 
 import newton
 from newton._src.solvers.vbd.particle_vbd_kernels import (
-    _guard_vbd_displacement_increment,
+    _guard_vbd_displacement_increment_full,
     accumulate_particle_body_contact_force_and_hessian,
     evaluate_dihedral_angle_based_bending_force_hessian,
     evaluate_neo_hookean_membrane_force_hessian,
@@ -3793,12 +3793,15 @@ def _round7_guard_fixture_kernel(
     event_pre_postcheck_aggregate_alpha: wp.array[float],
     event_pre_postcheck_nonlegacy_alpha: wp.array[float],
     event_pre_postcheck_applied_determinant: wp.array[float],
+    event_commit_token: wp.array[wp.int32],
+    generation_counter: wp.array[wp.int32],
+    provenance_failure: wp.array[wp.int32],
     reason_counts: wp.array[wp.int32],
     guarded_displacements: wp.array[wp.vec3],
 ):
     sample = wp.tid()
     particle = particle_ids[sample]
-    guarded_displacements[sample] = _guard_vbd_displacement_increment(
+    guarded_displacements[sample] = _guard_vbd_displacement_increment_full(
         particle,
         pos,
         displacements_before[sample],
@@ -3828,6 +3831,9 @@ def _round7_guard_fixture_kernel(
         event_pre_postcheck_aggregate_alpha,
         event_pre_postcheck_nonlegacy_alpha,
         event_pre_postcheck_applied_determinant,
+        event_commit_token,
+        generation_counter,
+        provenance_failure,
         reason_counts,
     )
 
@@ -3872,6 +3878,9 @@ def _round7_guard_fixture(
     event_pre_postcheck_aggregate_alpha = wp.empty(0, dtype=float, device=device)
     event_pre_postcheck_nonlegacy_alpha = wp.empty(0, dtype=float, device=device)
     event_pre_postcheck_applied_determinant = wp.empty(0, dtype=float, device=device)
+    event_commit_token = wp.empty(0, dtype=wp.int32, device=device)
+    generation_counter = wp.empty(1, dtype=wp.int32, device=device)
+    provenance_failure = wp.empty(1, dtype=wp.int32, device=device)
     reason_counts = wp.empty(0, dtype=wp.int32, device=device)
     outputs = wp.empty(particle_ids.shape[0], dtype=wp.vec3, device=device)
     wp.launch(
@@ -3907,6 +3916,9 @@ def _round7_guard_fixture(
             event_pre_postcheck_aggregate_alpha,
             event_pre_postcheck_nonlegacy_alpha,
             event_pre_postcheck_applied_determinant,
+            event_commit_token,
+            generation_counter,
+            provenance_failure,
             reason_counts,
         ],
         outputs=[outputs],
@@ -3966,6 +3978,9 @@ def _round7_guard_telemetry(device, policy, current, displacement):
             solver._positive_j_guard_event_pre_postcheck_aggregate_alpha,
             solver._positive_j_guard_event_pre_postcheck_nonlegacy_alpha,
             solver._positive_j_guard_event_pre_postcheck_applied_determinant,
+            solver._positive_j_guard_event_commit_token,
+            solver._positive_j_guard_generation_counter,
+            solver._positive_j_guard_provenance_failure,
             solver._positive_j_guard_reason_counts,
         ],
         outputs=[guarded],
