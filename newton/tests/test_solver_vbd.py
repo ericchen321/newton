@@ -3793,6 +3793,17 @@ def _round7_guard_fixture_kernel(
     event_pre_postcheck_aggregate_alpha: wp.array[float],
     event_pre_postcheck_nonlegacy_alpha: wp.array[float],
     event_pre_postcheck_applied_determinant: wp.array[float],
+    event_local_vertex_order: wp.array[wp.int32],
+    event_tet_vertex_ids: wp.array2d[wp.int32],
+    event_x0: wp.array[wp.vec3],
+    event_displacement_before: wp.array[wp.vec3],
+    event_delta: wp.array[wp.vec3],
+    event_proposal: wp.array[wp.vec3],
+    event_pre_applied_particle: wp.array[wp.vec3],
+    event_final_applied_particle: wp.array[wp.vec3],
+    event_actual_post_application_particle: wp.array[wp.vec3],
+    event_current_tet_positions: wp.array2d[wp.vec3],
+    event_rest_determinant: wp.array[float],
     event_commit_token: wp.array[wp.int32],
     generation_counter: wp.array[wp.int32],
     provenance_failure: wp.array[wp.int32],
@@ -3831,6 +3842,17 @@ def _round7_guard_fixture_kernel(
         event_pre_postcheck_aggregate_alpha,
         event_pre_postcheck_nonlegacy_alpha,
         event_pre_postcheck_applied_determinant,
+        event_local_vertex_order,
+        event_tet_vertex_ids,
+        event_x0,
+        event_displacement_before,
+        event_delta,
+        event_proposal,
+        event_pre_applied_particle,
+        event_final_applied_particle,
+        event_actual_post_application_particle,
+        event_current_tet_positions,
+        event_rest_determinant,
         event_commit_token,
         generation_counter,
         provenance_failure,
@@ -3878,6 +3900,17 @@ def _round7_guard_fixture(
     event_pre_postcheck_aggregate_alpha = wp.empty(0, dtype=float, device=device)
     event_pre_postcheck_nonlegacy_alpha = wp.empty(0, dtype=float, device=device)
     event_pre_postcheck_applied_determinant = wp.empty(0, dtype=float, device=device)
+    event_local_vertex_order = wp.empty(0, dtype=wp.int32, device=device)
+    event_tet_vertex_ids = wp.empty((0, 4), dtype=wp.int32, device=device)
+    event_x0 = wp.empty(0, dtype=wp.vec3, device=device)
+    event_displacement_before = wp.empty(0, dtype=wp.vec3, device=device)
+    event_delta = wp.empty(0, dtype=wp.vec3, device=device)
+    event_proposal = wp.empty(0, dtype=wp.vec3, device=device)
+    event_pre_applied_particle = wp.empty(0, dtype=wp.vec3, device=device)
+    event_final_applied_particle = wp.empty(0, dtype=wp.vec3, device=device)
+    event_actual_post_application_particle = wp.empty(0, dtype=wp.vec3, device=device)
+    event_current_tet_positions = wp.empty((0, 4), dtype=wp.vec3, device=device)
+    event_rest_determinant = wp.empty(0, dtype=float, device=device)
     event_commit_token = wp.empty(0, dtype=wp.int32, device=device)
     generation_counter = wp.empty(1, dtype=wp.int32, device=device)
     provenance_failure = wp.empty(1, dtype=wp.int32, device=device)
@@ -3916,6 +3949,17 @@ def _round7_guard_fixture(
             event_pre_postcheck_aggregate_alpha,
             event_pre_postcheck_nonlegacy_alpha,
             event_pre_postcheck_applied_determinant,
+            event_local_vertex_order,
+            event_tet_vertex_ids,
+            event_x0,
+            event_displacement_before,
+            event_delta,
+            event_proposal,
+            event_pre_applied_particle,
+            event_final_applied_particle,
+            event_actual_post_application_particle,
+            event_current_tet_positions,
+            event_rest_determinant,
             event_commit_token,
             generation_counter,
             provenance_failure,
@@ -3978,6 +4022,17 @@ def _round7_guard_telemetry(device, policy, current, displacement):
             solver._positive_j_guard_event_pre_postcheck_aggregate_alpha,
             solver._positive_j_guard_event_pre_postcheck_nonlegacy_alpha,
             solver._positive_j_guard_event_pre_postcheck_applied_determinant,
+            solver._positive_j_guard_event_local_vertex_order,
+            solver._positive_j_guard_event_tet_vertex_ids,
+            solver._positive_j_guard_event_x0,
+            solver._positive_j_guard_event_displacement_before,
+            solver._positive_j_guard_event_delta,
+            solver._positive_j_guard_event_proposal,
+            solver._positive_j_guard_event_pre_applied_particle,
+            solver._positive_j_guard_event_final_applied_particle,
+            solver._positive_j_guard_event_actual_post_application_particle,
+            solver._positive_j_guard_event_current_tet_positions,
+            solver._positive_j_guard_event_rest_determinant,
             solver._positive_j_guard_event_commit_token,
             solver._positive_j_guard_generation_counter,
             solver._positive_j_guard_provenance_failure,
@@ -4273,6 +4328,28 @@ def _test_vbd_positive_j_recovery_policy_and_telemetry(test, device):
     test.assertEqual(len(witnesses), 1)
     test.assertTrue(witnesses[0]["decision"])
     test.assertGreater(witnesses[0]["nonlegacy_alpha"], 0.0)
+    v3 = solver.read_positive_j_guard_telemetry_v3()
+    v3_witnesses = [record for record in v3["records"] if record["local_reason"] == "recovery_nonworsening"]
+    test.assertEqual(len(v3_witnesses), 1)
+    v3_witness = v3_witnesses[0]
+    for field in (
+        "commit_generation",
+        "local_vertex_order",
+        "tet_vertex_ids",
+        "x0_bits",
+        "displacement_before_bits",
+        "delta_bits",
+        "proposal_bits",
+        "analytic_pre_postcheck_applied_particle_bits",
+        "final_applied_particle_bits",
+        "actual_post_application_particle_bits",
+        "current_tet_positions_bits",
+        "rest_determinant_bits",
+        "source_stages",
+    ):
+        test.assertIn(field, v3_witness)
+    test.assertEqual(v3_witness["commit_generation"], v3_witness["commit_token"])
+    test.assertEqual(v3_witness["actual_post_application_particle_bits"], v3_witness["final_applied_particle_bits"])
 
     path_model = _round6_solver_model(device)
     path_solver = newton.solvers.SolverVBD(

@@ -51,6 +51,7 @@ from .particle_vbd_kernels import (
     capture_particle_active_set_cycle_state,
     capture_particle_constitutive_objective_audit,
     capture_particle_constitutive_objective_audit_state,
+    capture_positive_j_guard_actual_post_application,
     # Solver kernels (particle VBD)
     forward_step,
     reduce_particle_sweep_position_update,
@@ -937,6 +938,25 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._positive_j_guard_event_pre_postcheck_applied_determinant = wp.zeros(
             telemetry_slots, dtype=float, device=self.device
         )
+        self._positive_j_guard_event_local_vertex_order = wp.full(
+            telemetry_slots, -1, dtype=wp.int32, device=self.device
+        )
+        self._positive_j_guard_event_tet_vertex_ids = wp.full(
+            (telemetry_slots, 4), -1, dtype=wp.int32, device=self.device
+        )
+        self._positive_j_guard_event_x0 = wp.zeros(telemetry_slots, dtype=wp.vec3, device=self.device)
+        self._positive_j_guard_event_displacement_before = wp.zeros(telemetry_slots, dtype=wp.vec3, device=self.device)
+        self._positive_j_guard_event_delta = wp.zeros(telemetry_slots, dtype=wp.vec3, device=self.device)
+        self._positive_j_guard_event_proposal = wp.zeros(telemetry_slots, dtype=wp.vec3, device=self.device)
+        self._positive_j_guard_event_pre_applied_particle = wp.zeros(telemetry_slots, dtype=wp.vec3, device=self.device)
+        self._positive_j_guard_event_final_applied_particle = wp.zeros(telemetry_slots, dtype=wp.vec3, device=self.device)
+        self._positive_j_guard_event_actual_post_application_particle = wp.zeros(
+            telemetry_slots, dtype=wp.vec3, device=self.device
+        )
+        self._positive_j_guard_event_current_tet_positions = wp.zeros(
+            (telemetry_slots, 4), dtype=wp.vec3, device=self.device
+        )
+        self._positive_j_guard_event_rest_determinant = wp.zeros(telemetry_slots, dtype=float, device=self.device)
         self._positive_j_guard_event_commit_token = wp.zeros(
             telemetry_slots, dtype=wp.int32, device=self.device
         )
@@ -1043,16 +1063,78 @@ class SolverVBD(SolverBase, CouplingInterface):
             "event_pre_postcheck_aggregate_alpha": self._positive_j_guard_event_pre_postcheck_aggregate_alpha,
             "event_pre_postcheck_nonlegacy_alpha": self._positive_j_guard_event_pre_postcheck_nonlegacy_alpha,
             "event_pre_postcheck_applied_determinant": self._positive_j_guard_event_pre_postcheck_applied_determinant,
+            "event_local_vertex_order": self._positive_j_guard_event_local_vertex_order,
+            "event_tet_vertex_ids": self._positive_j_guard_event_tet_vertex_ids,
+            "event_x0": self._positive_j_guard_event_x0,
+            "event_displacement_before": self._positive_j_guard_event_displacement_before,
+            "event_delta": self._positive_j_guard_event_delta,
+            "event_proposal": self._positive_j_guard_event_proposal,
+            "event_pre_applied_particle": self._positive_j_guard_event_pre_applied_particle,
+            "event_final_applied_particle": self._positive_j_guard_event_final_applied_particle,
+            "event_actual_post_application_particle": self._positive_j_guard_event_actual_post_application_particle,
+            "event_current_tet_positions": self._positive_j_guard_event_current_tet_positions,
+            "event_rest_determinant": self._positive_j_guard_event_rest_determinant,
             "event_commit_token": self._positive_j_guard_event_commit_token,
         }
         for name, array in arrays.items():
-            if array is None or tuple(array.shape) != (capacity,):
+            expected_shape = (capacity,)
+            if name == "event_tet_vertex_ids":
+                expected_shape = (capacity, 4)
+            if name == "event_current_tet_positions":
+                expected_shape = (capacity, 4)
+            if array is None or tuple(array.shape) != expected_shape:
                 raise RuntimeError(f"positive-J guard v3 {name} buffer shape differs")
         failure = self._to_numpy(self._positive_j_guard_provenance_failure, dtype=np.int32).reshape(-1)
         generation = self._to_numpy(self._positive_j_guard_generation_counter, dtype=np.int64).reshape(-1)
         if failure.shape != (1,) or generation.shape != (1,) or int(failure[0]) != 0:
             raise RuntimeError("positive-J guard telemetry provenance failure or metadata is set")
         values = {name: self._to_numpy(array).reshape(-1) for name, array in arrays.items()}
+        vector_values = {
+            name: self._to_numpy(arrays[name]).reshape(capacity, 3)
+            for name in (
+                "event_x0",
+                "event_displacement_before",
+                "event_delta",
+                "event_proposal",
+                "event_pre_applied_particle",
+                "event_final_applied_particle",
+                "event_actual_post_application_particle",
+            )
+        }
+        tet_vertex_ids = self._to_numpy(arrays["event_tet_vertex_ids"], dtype=np.int32).reshape(capacity, 4)
+        current_tet_positions = self._to_numpy(arrays["event_current_tet_positions"]).reshape(capacity, 4, 3)
+        model_tet_vertex_ids = self._to_numpy(self.model.tet_indices, dtype=np.int32).reshape(tet_count, 4)
+        source_stages = {
+            "current_determinant": "current_snapshot",
+            "floor": "current_snapshot",
+            "proposed_determinant": "local_proposal",
+            "aggregate_alpha": "final_guard_decision",
+            "nonlegacy_alpha": "final_guard_decision",
+            "applied_determinant": "final_guard_decision",
+            "pre_postcheck_aggregate_alpha": "analytic_pre_postcheck",
+            "pre_postcheck_nonlegacy_alpha": "analytic_pre_postcheck",
+            "pre_postcheck_applied_determinant": "analytic_pre_postcheck",
+            "x0": "current_snapshot",
+            "displacement_before": "current_snapshot",
+            "delta": "local_proposal",
+            "proposal": "local_proposal",
+            "pre_applied_particle": "analytic_pre_postcheck",
+            "final_applied_particle": "final_guard_decision",
+            "actual_post_application_particle": "post_application_observation",
+            "current_tet_positions": "current_snapshot",
+            "rest_determinant": "current_snapshot",
+        }
+        record_source_stages = {
+            "x0": "current_snapshot",
+            "displacement_before": "current_snapshot",
+            "delta": "local_proposal",
+            "proposal": "local_proposal",
+            "analytic_pre_postcheck_applied_particle": "analytic_pre_postcheck",
+            "final_applied_particle": "final_guard_decision",
+            "actual_post_application_particle": "post_application_observation",
+            "current_tet_positions": "current_snapshot",
+            "rest_determinant": "current_snapshot",
+        }
         tokens = np.asarray(values["event_commit_token"], dtype=np.int64)
         sites = np.asarray(values["event_site"], dtype=np.int64)
         ordinals = np.asarray(values["event_ordinal"], dtype=np.int64)
@@ -1071,6 +1153,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             "event_pre_postcheck_aggregate_alpha",
             "event_pre_postcheck_nonlegacy_alpha",
             "event_pre_postcheck_applied_determinant",
+            "event_rest_determinant",
         )
         float32_values = {name: np.asarray(values[name], dtype=np.float32) for name in float_names}
         float_bits = {name: float32_values[name].view(np.uint32) for name in float_names}
@@ -1083,7 +1166,26 @@ class SolverVBD(SolverBase, CouplingInterface):
             if site == -2:
                 raise RuntimeError(f"positive-J guard v3 slot {slot} is still locked")
             if site == -1:
-                if token != 0 or ordinal != POSITIVE_J_GUARD_EVENT_ORDINAL_MAX:
+                empty_integer_fields = (
+                    int(values["event_solver_step_epoch"][slot]),
+                    int(values["event_pass_ordinal"][slot]),
+                    int(values["event_particle_id"][slot]),
+                    int(values["event_tet_id"][slot]),
+                    int(values["event_local_vertex_order"][slot]),
+                    int(values["event_decision"][slot]),
+                )
+                empty_float_fields = tuple(float32_values[name][slot] for name in float_names)
+                empty_vectors = tuple(vector_values[name][slot] for name in vector_values)
+                if (
+                    token != 0
+                    or ordinal != POSITIVE_J_GUARD_EVENT_ORDINAL_MAX
+                    or empty_integer_fields[:4] != (-1, -1, -1, -1)
+                    or empty_integer_fields[4:] != (-1, 0)
+                    or any(value != 0.0 for value in empty_float_fields)
+                    or np.any(tet_vertex_ids[slot] != -1)
+                    or any(np.any(vector != 0.0) for vector in empty_vectors)
+                    or np.any(current_tet_positions[slot] != 0.0)
+                ):
                     raise RuntimeError(f"positive-J guard v3 empty slot {slot} is malformed")
                 continue
             if site not in self._positive_j_guard_site_names or token <= 0:
@@ -1115,24 +1217,60 @@ class SolverVBD(SolverBase, CouplingInterface):
                 )
             if any(not np.isfinite(float32_values[name][slot]) for name in float_names):
                 raise RuntimeError(f"positive-J guard v3 slot {slot} contains nonfinite float data")
-            records.append(
-                {
-                    "slot": slot,
-                    "commit_token": token,
-                    "solver_step_epoch": epoch,
-                    "pass_ordinal": pass_ordinal,
-                    "event_ordinal": ordinal,
-                    "site": self._positive_j_guard_site_names[site],
-                    "particle_id": particle_id,
-                    "tet_id": tet_id,
-                    "local_reason": self._positive_j_guard_reason_names[reason_index],
-                    "aggregate_decision": bool(decisions[slot]),
-                    **{
-                        name.removeprefix("event_") + "_bits": int(float_bits[name][slot])
-                        for name in float_names
-                    },
-                }
-            )
+            local_vertex_order = int(values["event_local_vertex_order"][slot])
+            if local_vertex_order not in (0, 1, 2, 3):
+                raise RuntimeError(f"positive-J guard v3 slot {slot} local vertex order is malformed")
+            if not np.array_equal(tet_vertex_ids[slot], model_tet_vertex_ids[tet_id]):
+                raise RuntimeError(f"positive-J guard v3 slot {slot} tet vertex identity is malformed")
+            if any(
+                not np.all(np.isfinite(np.asarray(vector_values[name][slot], dtype=np.float32)))
+                for name in vector_values
+            ) or not np.all(np.isfinite(current_tet_positions[slot])):
+                raise RuntimeError(f"positive-J guard v3 slot {slot} contains nonfinite position data")
+            rest_determinant = np.float32(values["event_rest_determinant"][slot])
+            if not np.isfinite(rest_determinant) or rest_determinant <= 0.0:
+                raise RuntimeError(f"positive-J guard v3 slot {slot} rest determinant is malformed")
+            record = {
+                "slot": slot,
+                "commit_token": token,
+                "solver_step_epoch": epoch,
+                "pass_ordinal": pass_ordinal,
+                "event_ordinal": ordinal,
+                "site": self._positive_j_guard_site_names[site],
+                "particle_id": particle_id,
+                "tet_id": tet_id,
+                "local_reason": self._positive_j_guard_reason_names[reason_index],
+                "aggregate_decision": bool(decisions[slot]),
+                "commit_generation": token,
+                "local_vertex_order": local_vertex_order,
+                "tet_vertex_ids": [int(item) for item in tet_vertex_ids[slot]],
+                "rest_determinant_bits": int(
+                    np.asarray([np.float32(values["event_rest_determinant"][slot])], dtype=np.float32).view(np.uint32)[0]
+                ),
+                **{
+                    name.removeprefix("event_") + "_bits": int(float_bits[name][slot])
+                    for name in float_names
+                },
+            }
+            for name, vector_array in vector_values.items():
+                record_name = {
+                    "event_x0": "x0_bits",
+                    "event_displacement_before": "displacement_before_bits",
+                    "event_delta": "delta_bits",
+                    "event_proposal": "proposal_bits",
+                    "event_pre_applied_particle": "analytic_pre_postcheck_applied_particle_bits",
+                    "event_final_applied_particle": "final_applied_particle_bits",
+                    "event_actual_post_application_particle": "actual_post_application_particle_bits",
+                }[name]
+                record[record_name] = [
+                    int(bit) for bit in np.asarray(vector_array[slot], dtype=np.float32).view(np.uint32)
+                ]
+            record["current_tet_positions_bits"] = [
+                [int(bit) for bit in np.asarray(current_tet_positions[slot, vertex], dtype=np.float32).view(np.uint32)]
+                for vertex in range(4)
+            ]
+            record["source_stages"] = record_source_stages.copy()
+            records.append(record)
         if used_tokens and int(generation[0]) < max(used_tokens):
             raise RuntimeError("positive-J guard v3 generation counter regressed")
         reason_counts = self._to_numpy(self._positive_j_guard_reason_counts, dtype=np.int64).reshape(-1)
@@ -1162,12 +1300,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             "reason_counts": {
                 reason: int(reason_counts[index]) for index, reason in enumerate(self._positive_j_guard_reason_names)
             },
-            "source_stages": {
-                "current_determinant": "current_snapshot",
-                "proposed_determinant": "local_proposal",
-                "aggregate_alpha": "final_guard_decision",
-                "applied_determinant": "final_guard_decision",
-            },
+            "source_stages": source_stages,
             "records": records,
         }
 
@@ -2178,10 +2311,41 @@ class SolverVBD(SolverBase, CouplingInterface):
                 self._positive_j_guard_event_pre_postcheck_aggregate_alpha,
                 self._positive_j_guard_event_pre_postcheck_nonlegacy_alpha,
                 self._positive_j_guard_event_pre_postcheck_applied_determinant,
+                self._positive_j_guard_event_local_vertex_order,
+                self._positive_j_guard_event_tet_vertex_ids,
+                self._positive_j_guard_event_x0,
+                self._positive_j_guard_event_displacement_before,
+                self._positive_j_guard_event_delta,
+                self._positive_j_guard_event_proposal,
+                self._positive_j_guard_event_pre_applied_particle,
+                self._positive_j_guard_event_final_applied_particle,
+                self._positive_j_guard_event_actual_post_application_particle,
+                self._positive_j_guard_event_current_tet_positions,
+                self._positive_j_guard_event_rest_determinant,
                 self._positive_j_guard_event_commit_token,
                 self._positive_j_guard_generation_counter,
                 self._positive_j_guard_provenance_failure,
                 self._positive_j_guard_reason_counts,
+            ],
+            device=self.device,
+        )
+
+    def _capture_positive_j_guard_actual_post_application(self, particle_q, pass_ordinal: int):
+        """Passively capture the position written by the guarded path."""
+        if not self._positive_j_guard_enabled:
+            return
+        wp.launch(
+            kernel=capture_positive_j_guard_actual_post_application,
+            dim=self._positive_j_guard_event_ordinal.shape[0],
+            inputs=[
+                particle_q,
+                self._positive_j_guard_event_ordinal,
+                self._positive_j_guard_event_site,
+                self._positive_j_guard_event_particle_id,
+                self._positive_j_guard_event_pass_ordinal,
+                self._positive_j_guard_event_actual_post_application_particle,
+                self.model.particle_count,
+                int(pass_ordinal),
             ],
             device=self.device,
         )
@@ -3924,6 +4088,17 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self._positive_j_guard_event_pre_postcheck_aggregate_alpha,
                     self._positive_j_guard_event_pre_postcheck_nonlegacy_alpha,
                     self._positive_j_guard_event_pre_postcheck_applied_determinant,
+                    self._positive_j_guard_event_local_vertex_order,
+                    self._positive_j_guard_event_tet_vertex_ids,
+                    self._positive_j_guard_event_x0,
+                    self._positive_j_guard_event_displacement_before,
+                    self._positive_j_guard_event_delta,
+                    self._positive_j_guard_event_proposal,
+                    self._positive_j_guard_event_pre_applied_particle,
+                    self._positive_j_guard_event_final_applied_particle,
+                    self._positive_j_guard_event_actual_post_application_particle,
+                    self._positive_j_guard_event_current_tet_positions,
+                    self._positive_j_guard_event_rest_determinant,
                     self._positive_j_guard_event_commit_token,
                     self._positive_j_guard_generation_counter,
                     self._positive_j_guard_provenance_failure,
@@ -3934,6 +4109,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                 outputs=[self.particle_displacements],
                 device=self.device,
             )
+            self._capture_positive_j_guard_actual_post_application(particle_q, color)
 
     def _initialize_particles(self, state_in: State, state_out: State, dt: float):
         """Initialize particle positions for the VBD iteration."""
@@ -4587,6 +4763,17 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self._positive_j_guard_event_pre_postcheck_aggregate_alpha,
                         self._positive_j_guard_event_pre_postcheck_nonlegacy_alpha,
                         self._positive_j_guard_event_pre_postcheck_applied_determinant,
+                        self._positive_j_guard_event_local_vertex_order,
+                        self._positive_j_guard_event_tet_vertex_ids,
+                        self._positive_j_guard_event_x0,
+                        self._positive_j_guard_event_displacement_before,
+                        self._positive_j_guard_event_delta,
+                        self._positive_j_guard_event_proposal,
+                        self._positive_j_guard_event_pre_applied_particle,
+                        self._positive_j_guard_event_final_applied_particle,
+                        self._positive_j_guard_event_actual_post_application_particle,
+                        self._positive_j_guard_event_current_tet_positions,
+                        self._positive_j_guard_event_rest_determinant,
                         self._positive_j_guard_event_commit_token,
                         self._positive_j_guard_generation_counter,
                         self._positive_j_guard_provenance_failure,
@@ -4649,6 +4836,17 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self._positive_j_guard_event_pre_postcheck_aggregate_alpha,
                         self._positive_j_guard_event_pre_postcheck_nonlegacy_alpha,
                         self._positive_j_guard_event_pre_postcheck_applied_determinant,
+                        self._positive_j_guard_event_local_vertex_order,
+                        self._positive_j_guard_event_tet_vertex_ids,
+                        self._positive_j_guard_event_x0,
+                        self._positive_j_guard_event_displacement_before,
+                        self._positive_j_guard_event_delta,
+                        self._positive_j_guard_event_proposal,
+                        self._positive_j_guard_event_pre_applied_particle,
+                        self._positive_j_guard_event_final_applied_particle,
+                        self._positive_j_guard_event_actual_post_application_particle,
+                        self._positive_j_guard_event_current_tet_positions,
+                        self._positive_j_guard_event_rest_determinant,
                         self._positive_j_guard_event_commit_token,
                         self._positive_j_guard_generation_counter,
                         self._positive_j_guard_provenance_failure,
@@ -4662,6 +4860,10 @@ class SolverVBD(SolverBase, CouplingInterface):
                     device=self.device,
                 )
             self._penetration_free_truncation(state_in.particle_q)
+            self._capture_positive_j_guard_actual_post_application(
+                state_in.particle_q,
+                iter_num * len(self.model.particle_color_groups) + color,
+            )
             self._capture_particle_constitutive_objective_audit_pass(
                 state_in,
                 dt,
