@@ -711,6 +711,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             "recovery_decrease",
             "fraction_to_boundary",
             "recovery_nonworsening",
+            "applied_postcheck_reject",
         )
         self._positive_j_guard_site_names = {
             0: "initializer",
@@ -744,6 +745,15 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._positive_j_guard_event_decision = wp.zeros(telemetry_slots, dtype=wp.int32, device=self.device)
         self._positive_j_guard_event_nonlegacy_alpha = wp.zeros(telemetry_slots, dtype=float, device=self.device)
         self._positive_j_guard_event_applied_determinant = wp.zeros(telemetry_slots, dtype=float, device=self.device)
+        self._positive_j_guard_event_pre_postcheck_aggregate_alpha = wp.zeros(
+            telemetry_slots, dtype=float, device=self.device
+        )
+        self._positive_j_guard_event_pre_postcheck_nonlegacy_alpha = wp.zeros(
+            telemetry_slots, dtype=float, device=self.device
+        )
+        self._positive_j_guard_event_pre_postcheck_applied_determinant = wp.zeros(
+            telemetry_slots, dtype=float, device=self.device
+        )
         self._positive_j_guard_reason_counts = wp.zeros(
             POSITIVE_J_GUARD_REASON_COUNT if self._positive_j_guard_enabled else 0,
             dtype=wp.int32,
@@ -905,6 +915,9 @@ class SolverVBD(SolverBase, CouplingInterface):
             "event_decision": self._positive_j_guard_event_decision,
             "event_nonlegacy_alpha": self._positive_j_guard_event_nonlegacy_alpha,
             "event_applied_determinant": self._positive_j_guard_event_applied_determinant,
+            "event_pre_postcheck_aggregate_alpha": self._positive_j_guard_event_pre_postcheck_aggregate_alpha,
+            "event_pre_postcheck_nonlegacy_alpha": self._positive_j_guard_event_pre_postcheck_nonlegacy_alpha,
+            "event_pre_postcheck_applied_determinant": self._positive_j_guard_event_pre_postcheck_applied_determinant,
         }
         for name, array in arrays.items():
             if array is None or not hasattr(array, "shape") or tuple(array.shape) != (expected_slots,):
@@ -926,6 +939,15 @@ class SolverVBD(SolverBase, CouplingInterface):
         decisions = self._to_numpy(arrays["event_decision"], dtype=np.int64).reshape(-1)
         nonlegacy_alphas = self._to_numpy(arrays["event_nonlegacy_alpha"], dtype=float).reshape(-1)
         applied = self._to_numpy(arrays["event_applied_determinant"], dtype=float).reshape(-1)
+        pre_postcheck_alphas = self._to_numpy(
+            arrays["event_pre_postcheck_aggregate_alpha"], dtype=float
+        ).reshape(-1)
+        pre_postcheck_nonlegacy_alphas = self._to_numpy(
+            arrays["event_pre_postcheck_nonlegacy_alpha"], dtype=float
+        ).reshape(-1)
+        pre_postcheck_applied = self._to_numpy(
+            arrays["event_pre_postcheck_applied_determinant"], dtype=float
+        ).reshape(-1)
         reason_counts = self._to_numpy(reason_counts_array, dtype=np.int64).reshape(-1)
         if any(
             values.shape != (expected_slots,)
@@ -943,6 +965,9 @@ class SolverVBD(SolverBase, CouplingInterface):
                 decisions,
                 nonlegacy_alphas,
                 applied,
+                pre_postcheck_alphas,
+                pre_postcheck_nonlegacy_alphas,
+                pre_postcheck_applied,
             )
         ):
             raise RuntimeError("positive-J guard telemetry readback buffer length differs")
@@ -969,7 +994,17 @@ class SolverVBD(SolverBase, CouplingInterface):
                     )
                 ) or any(
                     not np.isfinite(float(values[slot])) or float(values[slot]) != 0.0
-                    for values in (current, floors, proposed, alphas, nonlegacy_alphas, applied)
+                    for values in (
+                        current,
+                        floors,
+                        proposed,
+                        alphas,
+                        nonlegacy_alphas,
+                        applied,
+                        pre_postcheck_alphas,
+                        pre_postcheck_nonlegacy_alphas,
+                        pre_postcheck_applied,
+                    )
                 ):
                     raise RuntimeError("positive-J guard telemetry sentinel slot is malformed")
                 continue
@@ -1003,6 +1038,9 @@ class SolverVBD(SolverBase, CouplingInterface):
                     "aggregate_decision": bool(decision),
                     "aggregate_nonlegacy_alpha": json_float(nonlegacy_alphas[slot]),
                     "applied_determinant_m3": json_float(applied[slot]),
+                    "pre_postcheck_aggregate_alpha": json_float(pre_postcheck_alphas[slot]),
+                    "pre_postcheck_nonlegacy_alpha": json_float(pre_postcheck_nonlegacy_alphas[slot]),
+                    "pre_postcheck_applied_determinant_m3": json_float(pre_postcheck_applied[slot]),
                 }
             )
         if any(int(value) < 0 for value in reason_counts):
@@ -1025,6 +1063,9 @@ class SolverVBD(SolverBase, CouplingInterface):
                 "local": "one_incident_tet_unscaled_candidate",
                 "aggregate": "one_particle_final_guard_decision",
                 "applied": "same_incident_tet_after_aggregate_alpha",
+                "pre_postcheck_aggregate": "one_particle_analytic_guard_decision_before_applied_postcheck",
+                "pre_postcheck_nonlegacy": "one_particle_analytic_nonlegacy_guard_decision_before_applied_postcheck",
+                "pre_postcheck_applied": "same_incident_tet_after_analytic_aggregate_alpha_before_applied_postcheck",
             },
             "reason_counts": {
                 reason: int(reason_counts[index])
@@ -1117,6 +1158,9 @@ class SolverVBD(SolverBase, CouplingInterface):
                 self._positive_j_guard_event_decision,
                 self._positive_j_guard_event_nonlegacy_alpha,
                 self._positive_j_guard_event_applied_determinant,
+                self._positive_j_guard_event_pre_postcheck_aggregate_alpha,
+                self._positive_j_guard_event_pre_postcheck_nonlegacy_alpha,
+                self._positive_j_guard_event_pre_postcheck_applied_determinant,
                 self._positive_j_guard_reason_counts,
             ],
             device=self.device,
@@ -2847,6 +2891,9 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self._positive_j_guard_event_decision,
                     self._positive_j_guard_event_nonlegacy_alpha,
                     self._positive_j_guard_event_applied_determinant,
+                    self._positive_j_guard_event_pre_postcheck_aggregate_alpha,
+                    self._positive_j_guard_event_pre_postcheck_nonlegacy_alpha,
+                    self._positive_j_guard_event_pre_postcheck_applied_determinant,
                     self._positive_j_guard_reason_counts,
                 ],
                 outputs=[self.particle_displacements],
@@ -3502,6 +3549,9 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self._positive_j_guard_event_decision,
                         self._positive_j_guard_event_nonlegacy_alpha,
                         self._positive_j_guard_event_applied_determinant,
+                        self._positive_j_guard_event_pre_postcheck_aggregate_alpha,
+                        self._positive_j_guard_event_pre_postcheck_nonlegacy_alpha,
+                        self._positive_j_guard_event_pre_postcheck_applied_determinant,
                         self._positive_j_guard_reason_counts,
                     ],
                     outputs=[
@@ -3556,6 +3606,9 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self._positive_j_guard_event_decision,
                         self._positive_j_guard_event_nonlegacy_alpha,
                         self._positive_j_guard_event_applied_determinant,
+                        self._positive_j_guard_event_pre_postcheck_aggregate_alpha,
+                        self._positive_j_guard_event_pre_postcheck_nonlegacy_alpha,
+                        self._positive_j_guard_event_pre_postcheck_applied_determinant,
                         self._positive_j_guard_reason_counts,
                     ],
                     outputs=[

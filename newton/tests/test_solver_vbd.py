@@ -3790,6 +3790,9 @@ def _round7_guard_fixture_kernel(
     event_decision: wp.array[wp.int32],
     event_nonlegacy_alpha: wp.array[float],
     event_applied_determinant: wp.array[float],
+    event_pre_postcheck_aggregate_alpha: wp.array[float],
+    event_pre_postcheck_nonlegacy_alpha: wp.array[float],
+    event_pre_postcheck_applied_determinant: wp.array[float],
     reason_counts: wp.array[wp.int32],
     guarded_displacements: wp.array[wp.vec3],
 ):
@@ -3822,6 +3825,9 @@ def _round7_guard_fixture_kernel(
         event_decision,
         event_nonlegacy_alpha,
         event_applied_determinant,
+        event_pre_postcheck_aggregate_alpha,
+        event_pre_postcheck_nonlegacy_alpha,
+        event_pre_postcheck_applied_determinant,
         reason_counts,
     )
 
@@ -3863,6 +3869,9 @@ def _round7_guard_fixture(
     event_decision = wp.empty(0, dtype=wp.int32, device=device)
     event_nonlegacy_alpha = wp.empty(0, dtype=float, device=device)
     event_applied_determinant = wp.empty(0, dtype=float, device=device)
+    event_pre_postcheck_aggregate_alpha = wp.empty(0, dtype=float, device=device)
+    event_pre_postcheck_nonlegacy_alpha = wp.empty(0, dtype=float, device=device)
+    event_pre_postcheck_applied_determinant = wp.empty(0, dtype=float, device=device)
     reason_counts = wp.empty(0, dtype=wp.int32, device=device)
     outputs = wp.empty(particle_ids.shape[0], dtype=wp.vec3, device=device)
     wp.launch(
@@ -3895,6 +3904,9 @@ def _round7_guard_fixture(
             event_decision,
             event_nonlegacy_alpha,
             event_applied_determinant,
+            event_pre_postcheck_aggregate_alpha,
+            event_pre_postcheck_nonlegacy_alpha,
+            event_pre_postcheck_applied_determinant,
             reason_counts,
         ],
         outputs=[outputs],
@@ -3951,6 +3963,9 @@ def _round7_guard_telemetry(device, policy, current, displacement):
             solver._positive_j_guard_event_decision,
             solver._positive_j_guard_event_nonlegacy_alpha,
             solver._positive_j_guard_event_applied_determinant,
+            solver._positive_j_guard_event_pre_postcheck_aggregate_alpha,
+            solver._positive_j_guard_event_pre_postcheck_nonlegacy_alpha,
+            solver._positive_j_guard_event_pre_postcheck_applied_determinant,
             solver._positive_j_guard_reason_counts,
         ],
         outputs=[guarded],
@@ -4264,6 +4279,67 @@ def _test_vbd_positive_j_recovery_policy_and_telemetry(test, device):
     test.assertIn("initializer", path_sites)
     test.assertIn("tile" if device.is_cuda else "scalar", path_sites)
 
+    # The reduced crossing is intentionally pinned to the CPU float32 order;
+    # CUDA's fused arithmetic is covered by the path assertions above.
+    if device.is_cuda:
+        return
+
+    # Reduced same-class regression: float32 determinant cancellation can make
+    # the aggregate analytic fraction leave one incident tet below its floor.
+    # This is deliberately not labeled as the captured H2/tet-4958 witness;
+    # that exact captured packet is validated by the HAG H2 contract test.
+    reduced_builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+    for position in _round6_scaled_tet(1.0e-8):
+        reduced_builder.add_particle(pos=wp.vec3(*position), vel=wp.vec3(0.0), mass=1.0e3)
+    reduced_builder.add_tetrahedron(0, 1, 2, 3, k_mu=1.0e3, k_lambda=1.0e3, k_damp=0.0)
+    reduced_builder.color()
+    reduced_model = reduced_builder.finalize(device=device)
+    reduced_solver = newton.solvers.SolverVBD(
+        reduced_model,
+        iterations=1,
+        particle_positive_j_guard_policy="recovery",
+        particle_positive_j_guard_telemetry=True,
+        particle_enable_tile_solve=False,
+        particle_collision_detection_interval=-1,
+    )
+    reduced_state = reduced_model.state()
+    reduced_current = np.asarray(
+        (
+            (0.0, -0.001623051706701517, 0.0),
+            (-0.006206773687154055, -0.005776475183665752, 0.0015851408243179321),
+            (-0.00245652231387794, -0.003332575550302863, 0.002166070742532611),
+            (-0.009053768590092659, -0.007205409463495016, -0.008841806091368198),
+        ),
+        dtype=np.float32,
+    )
+    reduced_state.particle_q.assign(reduced_current)
+    reduced_displacement = np.zeros((reduced_model.particle_count, 3), dtype=np.float32)
+    reduced_displacement[0, 2] = np.float32(1.2169401e-6)
+    reduced_solver.particle_displacements.assign(reduced_displacement)
+    reduced_solver._reset_positive_j_guard_telemetry()
+    reduced_solver._apply_guarded_particle_displacements(reduced_state.particle_q)
+    reduced_payload = reduced_solver.read_positive_j_guard_telemetry_v2()
+    reduced_records = [
+        record for record in reduced_payload["records"] if record["particle_id"] == 0
+    ]
+    reduced_rejections = [
+        record for record in reduced_records if record["local_reason"] == "applied_postcheck_reject"
+    ]
+    test.assertEqual(len(reduced_rejections), 1)
+    reduced_witness = reduced_rejections[0]
+    test.assertEqual(reduced_witness["aggregate_alpha"], 0.0)
+    test.assertFalse(reduced_witness["aggregate_decision"])
+    test.assertGreater(reduced_witness["pre_postcheck_aggregate_alpha"], 0.0)
+    test.assertLess(
+        reduced_witness["pre_postcheck_applied_determinant_m3"],
+        reduced_witness["local_determinant_floor_m3"],
+    )
+    test.assertEqual(
+        reduced_witness["applied_determinant_m3"],
+        reduced_witness["local_current_determinant_m3"],
+    )
+    np.testing.assert_array_equal(reduced_state.particle_q.numpy(), reduced_current)
+
 
 def _test_vbd_positive_j_scope_explicit_telemetry_v2(test, device):
     """Expose exact local, aggregate, and applied scopes with checked epochs."""
@@ -4311,6 +4387,9 @@ def _test_vbd_positive_j_scope_explicit_telemetry_v2(test, device):
             "local": "one_incident_tet_unscaled_candidate",
             "aggregate": "one_particle_final_guard_decision",
             "applied": "same_incident_tet_after_aggregate_alpha",
+            "pre_postcheck_aggregate": "one_particle_analytic_guard_decision_before_applied_postcheck",
+            "pre_postcheck_nonlegacy": "one_particle_analytic_nonlegacy_guard_decision_before_applied_postcheck",
+            "pre_postcheck_applied": "same_incident_tet_after_analytic_aggregate_alpha_before_applied_postcheck",
         },
     )
     records = payload["records"]
@@ -4329,6 +4408,9 @@ def _test_vbd_positive_j_scope_explicit_telemetry_v2(test, device):
         "aggregate_decision",
         "aggregate_nonlegacy_alpha",
         "applied_determinant_m3",
+        "pre_postcheck_aggregate_alpha",
+        "pre_postcheck_nonlegacy_alpha",
+        "pre_postcheck_applied_determinant_m3",
     }
     assert_keys = [set(record) for record in records]
     test.assertTrue(all(keys == record_keys for keys in assert_keys))

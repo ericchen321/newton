@@ -61,7 +61,8 @@ POSITIVE_J_GUARD_REASON_LEGACY_FLOOR_LOCK = 1
 POSITIVE_J_GUARD_REASON_RECOVERY_DECREASE = 2
 POSITIVE_J_GUARD_REASON_FRACTION_TO_BOUNDARY = 3
 POSITIVE_J_GUARD_REASON_RECOVERY_NONWORSENING = 4
-POSITIVE_J_GUARD_REASON_COUNT = 5
+POSITIVE_J_GUARD_REASON_APPLIED_POSTCHECK_REJECT = 5
+POSITIVE_J_GUARD_REASON_COUNT = 6
 POSITIVE_J_GUARD_SITE_INITIALIZER = 0
 POSITIVE_J_GUARD_SITE_TILE = 1
 POSITIVE_J_GUARD_SITE_SCALAR = 2
@@ -1569,6 +1570,9 @@ def reset_positive_j_guard_telemetry(
     event_decision: wp.array[wp.int32],
     event_nonlegacy_alpha: wp.array[float],
     event_applied_determinant: wp.array[float],
+    event_pre_postcheck_aggregate_alpha: wp.array[float],
+    event_pre_postcheck_nonlegacy_alpha: wp.array[float],
+    event_pre_postcheck_applied_determinant: wp.array[float],
     reason_counts: wp.array[wp.int32],
 ):
     slot = wp.tid()
@@ -1586,6 +1590,9 @@ def reset_positive_j_guard_telemetry(
         event_decision[slot] = 0
         event_nonlegacy_alpha[slot] = 0.0
         event_applied_determinant[slot] = 0.0
+        event_pre_postcheck_aggregate_alpha[slot] = 0.0
+        event_pre_postcheck_nonlegacy_alpha[slot] = 0.0
+        event_pre_postcheck_applied_determinant[slot] = 0.0
     if slot < POSITIVE_J_GUARD_REASON_COUNT:
         reason_counts[slot] = 0
 
@@ -1602,6 +1609,9 @@ def _record_positive_j_guard_event(
     alpha: float,
     nonlegacy_alpha: float,
     applied_determinant: float,
+    pre_postcheck_aggregate_alpha: float,
+    pre_postcheck_nonlegacy_alpha: float,
+    pre_postcheck_applied_determinant: float,
     solver_step_epoch: int,
     pass_ordinal: int,
     particle_count: int,
@@ -1618,6 +1628,9 @@ def _record_positive_j_guard_event(
     event_decision: wp.array[wp.int32],
     event_nonlegacy_alpha: wp.array[float],
     event_applied_determinant: wp.array[float],
+    event_pre_postcheck_aggregate_alpha: wp.array[float],
+    event_pre_postcheck_nonlegacy_alpha: wp.array[float],
+    event_pre_postcheck_applied_determinant: wp.array[float],
     reason_counts: wp.array[wp.int32],
 ):
     slot = tet_index * POSITIVE_J_GUARD_REASON_COUNT + reason
@@ -1636,6 +1649,9 @@ def _record_positive_j_guard_event(
         event_decision[slot] = int(alpha > 0.0)
         event_nonlegacy_alpha[slot] = nonlegacy_alpha
         event_applied_determinant[slot] = applied_determinant
+        event_pre_postcheck_aggregate_alpha[slot] = pre_postcheck_aggregate_alpha
+        event_pre_postcheck_nonlegacy_alpha[slot] = pre_postcheck_nonlegacy_alpha
+        event_pre_postcheck_applied_determinant[slot] = pre_postcheck_applied_determinant
     wp.atomic_add(reason_counts, reason, 1)
 
 
@@ -1667,6 +1683,9 @@ def _guard_vbd_displacement_increment(
     event_decision: wp.array[wp.int32],
     event_nonlegacy_alpha: wp.array[float],
     event_applied_determinant: wp.array[float],
+    event_pre_postcheck_aggregate_alpha: wp.array[float],
+    event_pre_postcheck_nonlegacy_alpha: wp.array[float],
+    event_pre_postcheck_applied_determinant: wp.array[float],
     reason_counts: wp.array[wp.int32],
 ):
     """Keep one colored vertex increment above the incident tet determinant floor."""
@@ -1747,12 +1766,123 @@ def _guard_vbd_displacement_increment(
                 # Recovery mode never admits a decreasing below-floor determinant.
                 alpha = 0.0
 
-    if telemetry_enabled:
-        # Re-evaluate the incident tets only for diagnostics.  This second pass
-        # records the final alpha and the non-legacy bound after all safety and
-        # fraction checks, while leaving the policy calculation above untouched.
+    pre_postcheck_aggregate_alpha = alpha
+    pre_postcheck_nonlegacy_alpha = nonlegacy_alpha
+    postcheck_reject = wp.int32(0)
+    postcheck_invalid = wp.int32(0)
+
+    # Verify the actual float32 applied position after the aggregate analytic
+    # decision, including every incident tet that did not set the minimum.
+    for adjacent_tet in range(get_vertex_num_adjacent_tets(particle_adjacency, particle_index)):
+        tet_index, vertex_order = get_vertex_adjacent_tet_id_order(particle_adjacency, particle_index, adjacent_tet)
+        i0 = tet_indices[tet_index, 0]
+        i1 = tet_indices[tet_index, 1]
+        i2 = tet_indices[tet_index, 2]
+        i3 = tet_indices[tet_index, 3]
+        applied_particle = x0 + pre_postcheck_aggregate_alpha * delta
+        applied_p0 = pos[i0]
+        applied_p1 = pos[i1]
+        applied_p2 = pos[i2]
+        applied_p3 = pos[i3]
+        if vertex_order == 0:
+            applied_p0 = applied_particle
+        elif vertex_order == 1:
+            applied_p1 = applied_particle
+        elif vertex_order == 2:
+            applied_p2 = applied_particle
+        else:
+            applied_p3 = applied_particle
+        applied_determinant = wp.dot(
+            wp.cross(applied_p1 - applied_p0, applied_p2 - applied_p0), applied_p3 - applied_p0
+        )
+        current_determinant = wp.dot(wp.cross(pos[i1] - pos[i0], pos[i2] - pos[i0]), pos[i3] - pos[i0])
+        inverse_rest_determinant = wp.determinant(tet_poses[tet_index])
+        rest_determinant = 1.0 / inverse_rest_determinant
+        determinant_floor = wp.min(
+            small_rest_cap_fraction * rest_determinant,
+            wp.max(absolute_floor_m3, relative_floor_fraction * rest_determinant),
+        )
+        if (
+            not wp.isfinite(rest_determinant)
+            or not wp.isfinite(current_determinant)
+            or not wp.isfinite(determinant_floor)
+            or not wp.isfinite(applied_determinant)
+            or not wp.isfinite(pre_postcheck_aggregate_alpha)
+            or not wp.isfinite(pre_postcheck_nonlegacy_alpha)
+            or rest_determinant <= 0.0
+            or current_determinant <= 0.0
+            or determinant_floor <= 0.0
+        ):
+            postcheck_invalid = 1
+        elif current_determinant > determinant_floor:
+            if applied_determinant < determinant_floor:
+                postcheck_reject = 1
+        elif applied_determinant < current_determinant:
+            postcheck_reject = 1
+
+    if postcheck_invalid != 0 or postcheck_reject != 0:
+        alpha = 0.0
+        nonlegacy_alpha = 0.0
+
+    if alpha == 0.0:
+        # A zero-alpha decision must leave every incident tet exactly unchanged.
         for adjacent_tet in range(get_vertex_num_adjacent_tets(particle_adjacency, particle_index)):
-            tet_index, vertex_order = get_vertex_adjacent_tet_id_order(particle_adjacency, particle_index, adjacent_tet)
+            tet_index, vertex_order = get_vertex_adjacent_tet_id_order(
+                particle_adjacency, particle_index, adjacent_tet
+            )
+            i0 = tet_indices[tet_index, 0]
+            i1 = tet_indices[tet_index, 1]
+            i2 = tet_indices[tet_index, 2]
+            i3 = tet_indices[tet_index, 3]
+            final_particle = x0 + alpha * delta
+            final_p0 = pos[i0]
+            final_p1 = pos[i1]
+            final_p2 = pos[i2]
+            final_p3 = pos[i3]
+            if vertex_order == 0:
+                final_p0 = final_particle
+            elif vertex_order == 1:
+                final_p1 = final_particle
+            elif vertex_order == 2:
+                final_p2 = final_particle
+            else:
+                final_p3 = final_particle
+            final_applied_determinant = wp.dot(
+                wp.cross(final_p1 - final_p0, final_p2 - final_p0), final_p3 - final_p0
+            )
+            current_determinant = wp.dot(wp.cross(pos[i1] - pos[i0], pos[i2] - pos[i0]), pos[i3] - pos[i0])
+            inverse_rest_determinant = wp.determinant(tet_poses[tet_index])
+            rest_determinant = 1.0 / inverse_rest_determinant
+            determinant_floor = wp.min(
+                small_rest_cap_fraction * rest_determinant,
+                wp.max(absolute_floor_m3, relative_floor_fraction * rest_determinant),
+            )
+            if (
+                not wp.isfinite(rest_determinant)
+                or not wp.isfinite(current_determinant)
+                or not wp.isfinite(determinant_floor)
+                or not wp.isfinite(final_applied_determinant)
+                or rest_determinant <= 0.0
+                or current_determinant <= 0.0
+                or determinant_floor <= 0.0
+                or final_applied_determinant != current_determinant
+                or final_applied_determinant <= 0.0
+                or (
+                    current_determinant > determinant_floor and final_applied_determinant < determinant_floor
+                )
+                or (
+                    current_determinant <= determinant_floor and final_applied_determinant < current_determinant
+                )
+            ):
+                postcheck_invalid = 1
+
+    if telemetry_enabled:
+        # Record local reasons with the final decision, while preserving the
+        # analytic aggregate and same-tet determinant before the postcheck.
+        for adjacent_tet in range(get_vertex_num_adjacent_tets(particle_adjacency, particle_index)):
+            tet_index, vertex_order = get_vertex_adjacent_tet_id_order(
+                particle_adjacency, particle_index, adjacent_tet
+            )
             i0 = tet_indices[tet_index, 0]
             i1 = tet_indices[tet_index, 1]
             i2 = tet_indices[tet_index, 2]
@@ -1771,27 +1901,46 @@ def _guard_vbd_displacement_increment(
                 p3 = x1
             current_determinant = wp.dot(wp.cross(pos[i1] - pos[i0], pos[i2] - pos[i0]), pos[i3] - pos[i0])
             proposed_determinant = wp.dot(wp.cross(p1 - p0, p2 - p0), p3 - p0)
-            applied_particle = x0 + alpha * delta
-            applied_p0 = pos[i0]
-            applied_p1 = pos[i1]
-            applied_p2 = pos[i2]
-            applied_p3 = pos[i3]
+            pre_applied_particle = x0 + pre_postcheck_aggregate_alpha * delta
+            pre_applied_p0 = pos[i0]
+            pre_applied_p1 = pos[i1]
+            pre_applied_p2 = pos[i2]
+            pre_applied_p3 = pos[i3]
             if vertex_order == 0:
-                applied_p0 = applied_particle
+                pre_applied_p0 = pre_applied_particle
             elif vertex_order == 1:
-                applied_p1 = applied_particle
+                pre_applied_p1 = pre_applied_particle
             elif vertex_order == 2:
-                applied_p2 = applied_particle
+                pre_applied_p2 = pre_applied_particle
             else:
-                applied_p3 = applied_particle
+                pre_applied_p3 = pre_applied_particle
+            pre_applied_determinant = wp.dot(
+                wp.cross(pre_applied_p1 - pre_applied_p0, pre_applied_p2 - pre_applied_p0),
+                pre_applied_p3 - pre_applied_p0,
+            )
+            final_applied_particle = x0 + alpha * delta
+            final_applied_p0 = pos[i0]
+            final_applied_p1 = pos[i1]
+            final_applied_p2 = pos[i2]
+            final_applied_p3 = pos[i3]
+            if vertex_order == 0:
+                final_applied_p0 = final_applied_particle
+            elif vertex_order == 1:
+                final_applied_p1 = final_applied_particle
+            elif vertex_order == 2:
+                final_applied_p2 = final_applied_particle
+            else:
+                final_applied_p3 = final_applied_particle
             applied_determinant = wp.dot(
-                wp.cross(applied_p1 - applied_p0, applied_p2 - applied_p0), applied_p3 - applied_p0
+                wp.cross(final_applied_p1 - final_applied_p0, final_applied_p2 - final_applied_p0),
+                final_applied_p3 - final_applied_p0,
             )
             rest_determinant = 1.0 / wp.determinant(tet_poses[tet_index])
             determinant_floor = wp.min(
                 small_rest_cap_fraction * rest_determinant,
                 wp.max(absolute_floor_m3, relative_floor_fraction * rest_determinant),
             )
+            local_invalid = wp.int32(0)
             if (
                 not wp.isfinite(rest_determinant)
                 or not wp.isfinite(current_determinant)
@@ -1801,6 +1950,7 @@ def _guard_vbd_displacement_increment(
                 or current_determinant <= 0.0
                 or determinant_floor <= 0.0
             ):
+                local_invalid = 1
                 reason = POSITIVE_J_GUARD_REASON_INVALID_INPUT
             elif current_determinant <= determinant_floor:
                 if policy_code == 0:
@@ -1814,9 +1964,41 @@ def _guard_vbd_displacement_increment(
                 if denominator > 0.0 and wp.isfinite(denominator):
                     reason = POSITIVE_J_GUARD_REASON_FRACTION_TO_BOUNDARY
                 else:
+                    local_invalid = 1
                     reason = POSITIVE_J_GUARD_REASON_INVALID_INPUT
             else:
                 reason = -1
+
+            precheck_miss = wp.int32(0)
+            precheck_invalid = wp.int32(0)
+            if (
+                not wp.isfinite(pre_applied_determinant)
+                or not wp.isfinite(pre_postcheck_aggregate_alpha)
+                or not wp.isfinite(pre_postcheck_nonlegacy_alpha)
+            ):
+                precheck_invalid = 1
+            elif not local_invalid:
+                if current_determinant > determinant_floor and pre_applied_determinant < determinant_floor:
+                    precheck_miss = 1
+                elif current_determinant <= determinant_floor and pre_applied_determinant < current_determinant:
+                    precheck_miss = 1
+
+            finalcheck_invalid = wp.int32(0)
+            if alpha == 0.0 and (
+                not wp.isfinite(applied_determinant)
+                or local_invalid
+                or not wp.isfinite(current_determinant)
+                or applied_determinant != current_determinant
+                or applied_determinant <= 0.0
+                or (
+                    current_determinant > determinant_floor and applied_determinant < determinant_floor
+                )
+                or (
+                    current_determinant <= determinant_floor and applied_determinant < current_determinant
+                )
+            ):
+                finalcheck_invalid = 1
+
             if reason >= 0:
                 _record_positive_j_guard_event(
                     reason,
@@ -1829,6 +2011,9 @@ def _guard_vbd_displacement_increment(
                     alpha,
                     nonlegacy_alpha,
                     applied_determinant,
+                    pre_postcheck_aggregate_alpha,
+                    pre_postcheck_nonlegacy_alpha,
+                    pre_applied_determinant,
                     solver_step_epoch,
                     pass_ordinal,
                     particle_count,
@@ -1845,6 +2030,81 @@ def _guard_vbd_displacement_increment(
                     event_decision,
                     event_nonlegacy_alpha,
                     event_applied_determinant,
+                    event_pre_postcheck_aggregate_alpha,
+                    event_pre_postcheck_nonlegacy_alpha,
+                    event_pre_postcheck_applied_determinant,
+                    reason_counts,
+                )
+            if postcheck_invalid != 0 and local_invalid == 0 and (precheck_invalid != 0 or finalcheck_invalid != 0):
+                _record_positive_j_guard_event(
+                    POSITIVE_J_GUARD_REASON_INVALID_INPUT,
+                    site,
+                    particle_index,
+                    tet_index,
+                    current_determinant,
+                    determinant_floor,
+                    proposed_determinant,
+                    alpha,
+                    nonlegacy_alpha,
+                    applied_determinant,
+                    pre_postcheck_aggregate_alpha,
+                    pre_postcheck_nonlegacy_alpha,
+                    pre_applied_determinant,
+                    solver_step_epoch,
+                    pass_ordinal,
+                    particle_count,
+                    event_ordinal,
+                    event_solver_step_epoch,
+                    event_pass_ordinal,
+                    event_site,
+                    event_particle_id,
+                    event_tet_id,
+                    event_current_determinant,
+                    event_floor,
+                    event_proposed_determinant,
+                    event_alpha,
+                    event_decision,
+                    event_nonlegacy_alpha,
+                    event_applied_determinant,
+                    event_pre_postcheck_aggregate_alpha,
+                    event_pre_postcheck_nonlegacy_alpha,
+                    event_pre_postcheck_applied_determinant,
+                    reason_counts,
+                )
+            if postcheck_invalid == 0 and precheck_miss != 0:
+                _record_positive_j_guard_event(
+                    POSITIVE_J_GUARD_REASON_APPLIED_POSTCHECK_REJECT,
+                    site,
+                    particle_index,
+                    tet_index,
+                    current_determinant,
+                    determinant_floor,
+                    proposed_determinant,
+                    alpha,
+                    nonlegacy_alpha,
+                    applied_determinant,
+                    pre_postcheck_aggregate_alpha,
+                    pre_postcheck_nonlegacy_alpha,
+                    pre_applied_determinant,
+                    solver_step_epoch,
+                    pass_ordinal,
+                    particle_count,
+                    event_ordinal,
+                    event_solver_step_epoch,
+                    event_pass_ordinal,
+                    event_site,
+                    event_particle_id,
+                    event_tet_id,
+                    event_current_determinant,
+                    event_floor,
+                    event_proposed_determinant,
+                    event_alpha,
+                    event_decision,
+                    event_nonlegacy_alpha,
+                    event_applied_determinant,
+                    event_pre_postcheck_aggregate_alpha,
+                    event_pre_postcheck_nonlegacy_alpha,
+                    event_pre_postcheck_applied_determinant,
                     reason_counts,
                 )
 
@@ -1881,6 +2141,9 @@ def apply_guarded_particle_displacements(
     event_decision: wp.array[wp.int32],
     event_nonlegacy_alpha: wp.array[float],
     event_applied_determinant: wp.array[float],
+    event_pre_postcheck_aggregate_alpha: wp.array[float],
+    event_pre_postcheck_nonlegacy_alpha: wp.array[float],
+    event_pre_postcheck_applied_determinant: wp.array[float],
     reason_counts: wp.array[wp.int32],
     particle_displacements: wp.array[wp.vec3],
 ):
@@ -1915,6 +2178,9 @@ def apply_guarded_particle_displacements(
         event_decision,
         event_nonlegacy_alpha,
         event_applied_determinant,
+        event_pre_postcheck_aggregate_alpha,
+        event_pre_postcheck_nonlegacy_alpha,
+        event_pre_postcheck_applied_determinant,
         reason_counts,
     )
     particle_displacements[particle_index] = guarded_displacement
@@ -2899,6 +3165,9 @@ def solve_elasticity_tile(
     event_decision: wp.array[wp.int32],
     event_nonlegacy_alpha: wp.array[float],
     event_applied_determinant: wp.array[float],
+    event_pre_postcheck_aggregate_alpha: wp.array[float],
+    event_pre_postcheck_nonlegacy_alpha: wp.array[float],
+    event_pre_postcheck_applied_determinant: wp.array[float],
     reason_counts: wp.array[wp.int32],
     # output
     particle_displacements: wp.array[wp.vec3],
@@ -3067,6 +3336,9 @@ def solve_elasticity_tile(
                 event_decision,
                 event_nonlegacy_alpha,
                 event_applied_determinant,
+                event_pre_postcheck_aggregate_alpha,
+                event_pre_postcheck_nonlegacy_alpha,
+                event_pre_postcheck_applied_determinant,
                 reason_counts,
             )
 
@@ -3113,6 +3385,9 @@ def solve_elasticity(
     event_decision: wp.array[wp.int32],
     event_nonlegacy_alpha: wp.array[float],
     event_applied_determinant: wp.array[float],
+    event_pre_postcheck_aggregate_alpha: wp.array[float],
+    event_pre_postcheck_nonlegacy_alpha: wp.array[float],
+    event_pre_postcheck_applied_determinant: wp.array[float],
     reason_counts: wp.array[wp.int32],
     # output
     particle_displacements: wp.array[wp.vec3],
@@ -3258,6 +3533,9 @@ def solve_elasticity(
             event_decision,
             event_nonlegacy_alpha,
             event_applied_determinant,
+            event_pre_postcheck_aggregate_alpha,
+            event_pre_postcheck_nonlegacy_alpha,
+            event_pre_postcheck_applied_determinant,
             reason_counts,
         )
 
