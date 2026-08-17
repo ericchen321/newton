@@ -68,6 +68,7 @@ POSITIVE_J_GUARD_SITE_TILE = 1
 POSITIVE_J_GUARD_SITE_SCALAR = 2
 POSITIVE_J_GUARD_EVENT_ORDINAL_MAX = 2**31 - 1
 PARTICLE_ACTIVE_SET_CYCLE_REASON_COUNT = POSITIVE_J_GUARD_REASON_COUNT
+H5_GUARD_LEDGER_REASON_COUNT = POSITIVE_J_GUARD_REASON_COUNT
 
 
 @wp.kernel
@@ -134,6 +135,21 @@ def capture_particle_constitutive_objective_audit_state(
     """Capture one complete particle state for the opt-in H5 audit."""
     particle = wp.tid()
     snapshots[snapshot_ordinal, particle] = particle_q[particle]
+
+
+@wp.kernel
+def reset_h5_guard_ledger(
+    event_count: wp.array[wp.int32],
+    overflow: wp.array[wp.int32],
+    reason_counts: wp.array[wp.int32],
+):
+    """Reset the bounded H5 guard ledger before one configured probe."""
+    slot = wp.tid()
+    if slot == 0:
+        event_count[0] = 0
+        overflow[0] = 0
+    if slot < H5_GUARD_LEDGER_REASON_COUNT:
+        reason_counts[slot] = 0
 
 
 @wp.kernel
@@ -1790,6 +1806,28 @@ def _record_positive_j_guard_event(
     event_pre_postcheck_nonlegacy_alpha: wp.array[float],
     event_pre_postcheck_applied_determinant: wp.array[float],
     reason_counts: wp.array[wp.int32],
+    h5_ledger_enabled: bool,
+    h5_ledger_capacity: int,
+    h5_ledger_event_count: wp.array[wp.int32],
+    h5_ledger_overflow: wp.array[wp.int32],
+    h5_ledger_solver_step_epoch: wp.array[wp.int32],
+    h5_ledger_pass_ordinal: wp.array[wp.int32],
+    h5_ledger_site: wp.array[wp.int32],
+    h5_ledger_particle_id: wp.array[wp.int32],
+    h5_ledger_tet_id: wp.array[wp.int32],
+    h5_ledger_local_reason: wp.array[wp.int32],
+    h5_ledger_aggregate_decision: wp.array[wp.int32],
+    h5_ledger_current_determinant: wp.array[float],
+    h5_ledger_floor: wp.array[float],
+    h5_ledger_proposed_determinant: wp.array[float],
+    h5_ledger_aggregate_alpha: wp.array[float],
+    h5_ledger_nonlegacy_alpha: wp.array[float],
+    h5_ledger_applied_determinant: wp.array[float],
+    h5_ledger_pre_postcheck_aggregate_alpha: wp.array[float],
+    h5_ledger_pre_postcheck_nonlegacy_alpha: wp.array[float],
+    h5_ledger_pre_postcheck_applied_determinant: wp.array[float],
+    h5_ledger_append_ordinal: wp.array[wp.int32],
+    h5_ledger_reason_counts: wp.array[wp.int32],
 ):
     if event_ordinal.shape[0] == 0:
         return
@@ -1813,6 +1851,29 @@ def _record_positive_j_guard_event(
         event_pre_postcheck_nonlegacy_alpha[slot] = pre_postcheck_nonlegacy_alpha
         event_pre_postcheck_applied_determinant[slot] = pre_postcheck_applied_determinant
     wp.atomic_add(reason_counts, reason, 1)
+    if h5_ledger_enabled and h5_ledger_capacity > 0:
+        append_ordinal = wp.atomic_add(h5_ledger_event_count, 0, 1)
+        wp.atomic_add(h5_ledger_reason_counts, reason, 1)
+        if append_ordinal >= h5_ledger_capacity:
+            wp.atomic_min(h5_ledger_overflow, 0, wp.int32(1))
+        else:
+            h5_ledger_solver_step_epoch[append_ordinal] = solver_step_epoch
+            h5_ledger_pass_ordinal[append_ordinal] = pass_ordinal
+            h5_ledger_site[append_ordinal] = site
+            h5_ledger_particle_id[append_ordinal] = particle_index
+            h5_ledger_tet_id[append_ordinal] = tet_index
+            h5_ledger_local_reason[append_ordinal] = reason
+            h5_ledger_aggregate_decision[append_ordinal] = wp.int32(alpha > 0.0)
+            h5_ledger_current_determinant[append_ordinal] = current_determinant
+            h5_ledger_floor[append_ordinal] = determinant_floor
+            h5_ledger_proposed_determinant[append_ordinal] = proposed_determinant
+            h5_ledger_aggregate_alpha[append_ordinal] = alpha
+            h5_ledger_nonlegacy_alpha[append_ordinal] = nonlegacy_alpha
+            h5_ledger_applied_determinant[append_ordinal] = applied_determinant
+            h5_ledger_pre_postcheck_aggregate_alpha[append_ordinal] = pre_postcheck_aggregate_alpha
+            h5_ledger_pre_postcheck_nonlegacy_alpha[append_ordinal] = pre_postcheck_nonlegacy_alpha
+            h5_ledger_pre_postcheck_applied_determinant[append_ordinal] = pre_postcheck_applied_determinant
+            h5_ledger_append_ordinal[append_ordinal] = append_ordinal
 
 
 @wp.func
@@ -1894,6 +1955,28 @@ def _guard_vbd_displacement_increment(
     active_set_cycle_event_postcheck_rejected: wp.array[wp.int32],
     active_set_cycle_reason_counts: wp.array[wp.int32],
     active_set_cycle_overflow: wp.array[wp.int32],
+    h5_ledger_enabled: bool,
+    h5_ledger_capacity: int,
+    h5_ledger_event_count: wp.array[wp.int32],
+    h5_ledger_overflow: wp.array[wp.int32],
+    h5_ledger_solver_step_epoch: wp.array[wp.int32],
+    h5_ledger_pass_ordinal: wp.array[wp.int32],
+    h5_ledger_site: wp.array[wp.int32],
+    h5_ledger_particle_id: wp.array[wp.int32],
+    h5_ledger_tet_id: wp.array[wp.int32],
+    h5_ledger_local_reason: wp.array[wp.int32],
+    h5_ledger_aggregate_decision: wp.array[wp.int32],
+    h5_ledger_current_determinant: wp.array[float],
+    h5_ledger_floor: wp.array[float],
+    h5_ledger_proposed_determinant: wp.array[float],
+    h5_ledger_aggregate_alpha: wp.array[float],
+    h5_ledger_nonlegacy_alpha: wp.array[float],
+    h5_ledger_applied_determinant: wp.array[float],
+    h5_ledger_pre_postcheck_aggregate_alpha: wp.array[float],
+    h5_ledger_pre_postcheck_nonlegacy_alpha: wp.array[float],
+    h5_ledger_pre_postcheck_applied_determinant: wp.array[float],
+    h5_ledger_append_ordinal: wp.array[wp.int32],
+    h5_ledger_reason_counts: wp.array[wp.int32],
 ):
     """Keep one colored vertex increment above the incident tet determinant floor."""
     relative_floor_fraction = 1.0e-4
@@ -2227,6 +2310,28 @@ def _guard_vbd_displacement_increment(
                     event_pre_postcheck_nonlegacy_alpha,
                     event_pre_postcheck_applied_determinant,
                     reason_counts,
+                    h5_ledger_enabled,
+                    h5_ledger_capacity,
+                    h5_ledger_event_count,
+                    h5_ledger_overflow,
+                    h5_ledger_solver_step_epoch,
+                    h5_ledger_pass_ordinal,
+                    h5_ledger_site,
+                    h5_ledger_particle_id,
+                    h5_ledger_tet_id,
+                    h5_ledger_local_reason,
+                    h5_ledger_aggregate_decision,
+                    h5_ledger_current_determinant,
+                    h5_ledger_floor,
+                    h5_ledger_proposed_determinant,
+                    h5_ledger_aggregate_alpha,
+                    h5_ledger_nonlegacy_alpha,
+                    h5_ledger_applied_determinant,
+                    h5_ledger_pre_postcheck_aggregate_alpha,
+                    h5_ledger_pre_postcheck_nonlegacy_alpha,
+                    h5_ledger_pre_postcheck_applied_determinant,
+                    h5_ledger_append_ordinal,
+                    h5_ledger_reason_counts,
                 )
                 _record_particle_active_set_cycle_event(
                     tet_index,
@@ -2286,6 +2391,28 @@ def _guard_vbd_displacement_increment(
                     event_pre_postcheck_nonlegacy_alpha,
                     event_pre_postcheck_applied_determinant,
                     reason_counts,
+                    h5_ledger_enabled,
+                    h5_ledger_capacity,
+                    h5_ledger_event_count,
+                    h5_ledger_overflow,
+                    h5_ledger_solver_step_epoch,
+                    h5_ledger_pass_ordinal,
+                    h5_ledger_site,
+                    h5_ledger_particle_id,
+                    h5_ledger_tet_id,
+                    h5_ledger_local_reason,
+                    h5_ledger_aggregate_decision,
+                    h5_ledger_current_determinant,
+                    h5_ledger_floor,
+                    h5_ledger_proposed_determinant,
+                    h5_ledger_aggregate_alpha,
+                    h5_ledger_nonlegacy_alpha,
+                    h5_ledger_applied_determinant,
+                    h5_ledger_pre_postcheck_aggregate_alpha,
+                    h5_ledger_pre_postcheck_nonlegacy_alpha,
+                    h5_ledger_pre_postcheck_applied_determinant,
+                    h5_ledger_append_ordinal,
+                    h5_ledger_reason_counts,
                 )
                 _record_particle_active_set_cycle_event(
                     tet_index,
@@ -2340,6 +2467,28 @@ def _guard_vbd_displacement_increment(
                     event_pre_postcheck_nonlegacy_alpha,
                     event_pre_postcheck_applied_determinant,
                     reason_counts,
+                    h5_ledger_enabled,
+                    h5_ledger_capacity,
+                    h5_ledger_event_count,
+                    h5_ledger_overflow,
+                    h5_ledger_solver_step_epoch,
+                    h5_ledger_pass_ordinal,
+                    h5_ledger_site,
+                    h5_ledger_particle_id,
+                    h5_ledger_tet_id,
+                    h5_ledger_local_reason,
+                    h5_ledger_aggregate_decision,
+                    h5_ledger_current_determinant,
+                    h5_ledger_floor,
+                    h5_ledger_proposed_determinant,
+                    h5_ledger_aggregate_alpha,
+                    h5_ledger_nonlegacy_alpha,
+                    h5_ledger_applied_determinant,
+                    h5_ledger_pre_postcheck_aggregate_alpha,
+                    h5_ledger_pre_postcheck_nonlegacy_alpha,
+                    h5_ledger_pre_postcheck_applied_determinant,
+                    h5_ledger_append_ordinal,
+                    h5_ledger_reason_counts,
                 )
                 _record_particle_active_set_cycle_event(
                     tet_index,
@@ -2407,6 +2556,28 @@ def apply_guarded_particle_displacements(
     active_set_cycle_event_postcheck_rejected: wp.array[wp.int32],
     active_set_cycle_reason_counts: wp.array[wp.int32],
     active_set_cycle_overflow: wp.array[wp.int32],
+    h5_ledger_enabled: bool,
+    h5_ledger_capacity: int,
+    h5_ledger_event_count: wp.array[wp.int32],
+    h5_ledger_overflow: wp.array[wp.int32],
+    h5_ledger_solver_step_epoch: wp.array[wp.int32],
+    h5_ledger_pass_ordinal: wp.array[wp.int32],
+    h5_ledger_site: wp.array[wp.int32],
+    h5_ledger_particle_id: wp.array[wp.int32],
+    h5_ledger_tet_id: wp.array[wp.int32],
+    h5_ledger_local_reason: wp.array[wp.int32],
+    h5_ledger_aggregate_decision: wp.array[wp.int32],
+    h5_ledger_current_determinant: wp.array[float],
+    h5_ledger_floor: wp.array[float],
+    h5_ledger_proposed_determinant: wp.array[float],
+    h5_ledger_aggregate_alpha: wp.array[float],
+    h5_ledger_nonlegacy_alpha: wp.array[float],
+    h5_ledger_applied_determinant: wp.array[float],
+    h5_ledger_pre_postcheck_aggregate_alpha: wp.array[float],
+    h5_ledger_pre_postcheck_nonlegacy_alpha: wp.array[float],
+    h5_ledger_pre_postcheck_applied_determinant: wp.array[float],
+    h5_ledger_append_ordinal: wp.array[wp.int32],
+    h5_ledger_reason_counts: wp.array[wp.int32],
     particle_displacements: wp.array[wp.vec3],
 ):
     """Apply one already-truncated color group through the positive-J guard."""
@@ -2454,6 +2625,28 @@ def apply_guarded_particle_displacements(
         active_set_cycle_event_postcheck_rejected,
         active_set_cycle_reason_counts,
         active_set_cycle_overflow,
+        h5_ledger_enabled,
+        h5_ledger_capacity,
+        h5_ledger_event_count,
+        h5_ledger_overflow,
+        h5_ledger_solver_step_epoch,
+        h5_ledger_pass_ordinal,
+        h5_ledger_site,
+        h5_ledger_particle_id,
+        h5_ledger_tet_id,
+        h5_ledger_local_reason,
+        h5_ledger_aggregate_decision,
+        h5_ledger_current_determinant,
+        h5_ledger_floor,
+        h5_ledger_proposed_determinant,
+        h5_ledger_aggregate_alpha,
+        h5_ledger_nonlegacy_alpha,
+        h5_ledger_applied_determinant,
+        h5_ledger_pre_postcheck_aggregate_alpha,
+        h5_ledger_pre_postcheck_nonlegacy_alpha,
+        h5_ledger_pre_postcheck_applied_determinant,
+        h5_ledger_append_ordinal,
+        h5_ledger_reason_counts,
     )
     particle_displacements[particle_index] = guarded_displacement
     pos[particle_index] = pos[particle_index] + guarded_displacement
@@ -3451,6 +3644,28 @@ def solve_elasticity_tile(
     active_set_cycle_event_postcheck_rejected: wp.array[wp.int32],
     active_set_cycle_reason_counts: wp.array[wp.int32],
     active_set_cycle_overflow: wp.array[wp.int32],
+    h5_ledger_enabled: bool,
+    h5_ledger_capacity: int,
+    h5_ledger_event_count: wp.array[wp.int32],
+    h5_ledger_overflow: wp.array[wp.int32],
+    h5_ledger_solver_step_epoch: wp.array[wp.int32],
+    h5_ledger_pass_ordinal: wp.array[wp.int32],
+    h5_ledger_site: wp.array[wp.int32],
+    h5_ledger_particle_id: wp.array[wp.int32],
+    h5_ledger_tet_id: wp.array[wp.int32],
+    h5_ledger_local_reason: wp.array[wp.int32],
+    h5_ledger_aggregate_decision: wp.array[wp.int32],
+    h5_ledger_current_determinant: wp.array[float],
+    h5_ledger_floor: wp.array[float],
+    h5_ledger_proposed_determinant: wp.array[float],
+    h5_ledger_aggregate_alpha: wp.array[float],
+    h5_ledger_nonlegacy_alpha: wp.array[float],
+    h5_ledger_applied_determinant: wp.array[float],
+    h5_ledger_pre_postcheck_aggregate_alpha: wp.array[float],
+    h5_ledger_pre_postcheck_nonlegacy_alpha: wp.array[float],
+    h5_ledger_pre_postcheck_applied_determinant: wp.array[float],
+    h5_ledger_append_ordinal: wp.array[wp.int32],
+    h5_ledger_reason_counts: wp.array[wp.int32],
     # output
     particle_displacements: wp.array[wp.vec3],
 ):
@@ -3632,6 +3847,28 @@ def solve_elasticity_tile(
                 active_set_cycle_event_postcheck_rejected,
                 active_set_cycle_reason_counts,
                 active_set_cycle_overflow,
+                h5_ledger_enabled,
+                h5_ledger_capacity,
+                h5_ledger_event_count,
+                h5_ledger_overflow,
+                h5_ledger_solver_step_epoch,
+                h5_ledger_pass_ordinal,
+                h5_ledger_site,
+                h5_ledger_particle_id,
+                h5_ledger_tet_id,
+                h5_ledger_local_reason,
+                h5_ledger_aggregate_decision,
+                h5_ledger_current_determinant,
+                h5_ledger_floor,
+                h5_ledger_proposed_determinant,
+                h5_ledger_aggregate_alpha,
+                h5_ledger_nonlegacy_alpha,
+                h5_ledger_applied_determinant,
+                h5_ledger_pre_postcheck_aggregate_alpha,
+                h5_ledger_pre_postcheck_nonlegacy_alpha,
+                h5_ledger_pre_postcheck_applied_determinant,
+                h5_ledger_append_ordinal,
+                h5_ledger_reason_counts,
             )
 
 
@@ -3691,6 +3928,28 @@ def solve_elasticity(
     active_set_cycle_event_postcheck_rejected: wp.array[wp.int32],
     active_set_cycle_reason_counts: wp.array[wp.int32],
     active_set_cycle_overflow: wp.array[wp.int32],
+    h5_ledger_enabled: bool,
+    h5_ledger_capacity: int,
+    h5_ledger_event_count: wp.array[wp.int32],
+    h5_ledger_overflow: wp.array[wp.int32],
+    h5_ledger_solver_step_epoch: wp.array[wp.int32],
+    h5_ledger_pass_ordinal: wp.array[wp.int32],
+    h5_ledger_site: wp.array[wp.int32],
+    h5_ledger_particle_id: wp.array[wp.int32],
+    h5_ledger_tet_id: wp.array[wp.int32],
+    h5_ledger_local_reason: wp.array[wp.int32],
+    h5_ledger_aggregate_decision: wp.array[wp.int32],
+    h5_ledger_current_determinant: wp.array[float],
+    h5_ledger_floor: wp.array[float],
+    h5_ledger_proposed_determinant: wp.array[float],
+    h5_ledger_aggregate_alpha: wp.array[float],
+    h5_ledger_nonlegacy_alpha: wp.array[float],
+    h5_ledger_applied_determinant: wp.array[float],
+    h5_ledger_pre_postcheck_aggregate_alpha: wp.array[float],
+    h5_ledger_pre_postcheck_nonlegacy_alpha: wp.array[float],
+    h5_ledger_pre_postcheck_applied_determinant: wp.array[float],
+    h5_ledger_append_ordinal: wp.array[wp.int32],
+    h5_ledger_reason_counts: wp.array[wp.int32],
     # output
     particle_displacements: wp.array[wp.vec3],
 ):
@@ -3849,6 +4108,28 @@ def solve_elasticity(
             active_set_cycle_event_postcheck_rejected,
             active_set_cycle_reason_counts,
             active_set_cycle_overflow,
+            h5_ledger_enabled,
+            h5_ledger_capacity,
+            h5_ledger_event_count,
+            h5_ledger_overflow,
+            h5_ledger_solver_step_epoch,
+            h5_ledger_pass_ordinal,
+            h5_ledger_site,
+            h5_ledger_particle_id,
+            h5_ledger_tet_id,
+            h5_ledger_local_reason,
+            h5_ledger_aggregate_decision,
+            h5_ledger_current_determinant,
+            h5_ledger_floor,
+            h5_ledger_proposed_determinant,
+            h5_ledger_aggregate_alpha,
+            h5_ledger_nonlegacy_alpha,
+            h5_ledger_applied_determinant,
+            h5_ledger_pre_postcheck_aggregate_alpha,
+            h5_ledger_pre_postcheck_nonlegacy_alpha,
+            h5_ledger_pre_postcheck_applied_determinant,
+            h5_ledger_append_ordinal,
+            h5_ledger_reason_counts,
         )
 
 

@@ -31,6 +31,7 @@ from ..xpbd import kernels as xpbd_kernels
 from ..xpbd.kernels import apply_joint_forces
 from . import particle_vbd_kernels, rigid_vbd_kernels, vbd_coupling_kernels
 from .particle_vbd_kernels import (
+    H5_GUARD_LEDGER_REASON_COUNT,
     NUM_THREADS_PER_COLLISION_PRIMITIVE,
     PARTICLE_ACTIVE_SET_CYCLE_REASON_COUNT,
     POSITIVE_J_GUARD_EVENT_ORDINAL_MAX,
@@ -53,6 +54,7 @@ from .particle_vbd_kernels import (
     # Solver kernels (particle VBD)
     forward_step,
     reduce_particle_sweep_position_update,
+    reset_h5_guard_ledger,
     reset_particle_state,
     reset_particle_sweep_telemetry,
     reset_positive_j_guard_telemetry,
@@ -791,6 +793,27 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._particle_constitutive_objective_audit_step_epoch = 0
         self._particle_constitutive_objective_audit_last_read_epoch = 0
         self._particle_constitutive_objective_audit_capture_active = False
+        self._h5_guard_ledger_capacity = 0
+        self._h5_guard_ledger_event_count = None
+        self._h5_guard_ledger_overflow = None
+        self._h5_guard_ledger_solver_step_epoch = None
+        self._h5_guard_ledger_pass_ordinal = None
+        self._h5_guard_ledger_site = None
+        self._h5_guard_ledger_particle_id = None
+        self._h5_guard_ledger_tet_id = None
+        self._h5_guard_ledger_local_reason = None
+        self._h5_guard_ledger_aggregate_decision = None
+        self._h5_guard_ledger_current_determinant = None
+        self._h5_guard_ledger_floor = None
+        self._h5_guard_ledger_proposed_determinant = None
+        self._h5_guard_ledger_aggregate_alpha = None
+        self._h5_guard_ledger_nonlegacy_alpha = None
+        self._h5_guard_ledger_applied_determinant = None
+        self._h5_guard_ledger_pre_postcheck_aggregate_alpha = None
+        self._h5_guard_ledger_pre_postcheck_nonlegacy_alpha = None
+        self._h5_guard_ledger_pre_postcheck_applied_determinant = None
+        self._h5_guard_ledger_append_ordinal = None
+        self._h5_guard_ledger_reason_counts = None
         if self._particle_constitutive_objective_audit_enabled:
             color_group_count = len(model.particle_color_groups)
             pass_count = int(self.iterations) * color_group_count
@@ -821,6 +844,51 @@ class SolverVBD(SolverBase, CouplingInterface):
                 row_count, dtype=wp.vec3, device=self.device
             )
             self._particle_constitutive_objective_audit_applied = wp.zeros(row_count, dtype=wp.vec3, device=self.device)
+
+            adjacency = model.soft_mesh_adjacency_device
+            offsets = np.asarray(adjacency.v_adj_tets_offsets.numpy(), dtype=np.int64).reshape(-1)
+            if offsets.shape != (int(model.particle_count) + 1,) or offsets.size == 0:
+                raise ValueError("particle constitutive objective audit adjacency offsets are malformed")
+            if np.any(offsets < 0) or np.any(offsets[1:] < offsets[:-1]):
+                raise ValueError("particle constitutive objective audit adjacency offsets are malformed")
+            incidence_pairs = int(offsets[-1])
+            ledger_passes = int(color_group_count) * (int(self.iterations) + 1)
+            max_events_per_incident_tet = 3
+            ledger_capacity = incidence_pairs * ledger_passes * max_events_per_incident_tet
+            if ledger_capacity < 0 or ledger_capacity > 2**31 - 1:
+                raise OverflowError("particle constitutive objective audit guard ledger capacity exceeds int32")
+            if incidence_pairs <= 0 or ledger_passes <= 0:
+                raise ValueError("particle constitutive objective audit guard ledger cardinality is malformed")
+            self._h5_guard_ledger_capacity = int(ledger_capacity)
+            ledger_count = self._h5_guard_ledger_capacity
+            self._h5_guard_ledger_event_count = wp.zeros(1, dtype=wp.int32, device=self.device)
+            self._h5_guard_ledger_overflow = wp.zeros(1, dtype=wp.int32, device=self.device)
+            self._h5_guard_ledger_solver_step_epoch = wp.zeros(ledger_count, dtype=wp.int32, device=self.device)
+            self._h5_guard_ledger_pass_ordinal = wp.zeros(ledger_count, dtype=wp.int32, device=self.device)
+            self._h5_guard_ledger_site = wp.zeros(ledger_count, dtype=wp.int32, device=self.device)
+            self._h5_guard_ledger_particle_id = wp.zeros(ledger_count, dtype=wp.int32, device=self.device)
+            self._h5_guard_ledger_tet_id = wp.zeros(ledger_count, dtype=wp.int32, device=self.device)
+            self._h5_guard_ledger_local_reason = wp.zeros(ledger_count, dtype=wp.int32, device=self.device)
+            self._h5_guard_ledger_aggregate_decision = wp.zeros(ledger_count, dtype=wp.int32, device=self.device)
+            self._h5_guard_ledger_current_determinant = wp.zeros(ledger_count, dtype=float, device=self.device)
+            self._h5_guard_ledger_floor = wp.zeros(ledger_count, dtype=float, device=self.device)
+            self._h5_guard_ledger_proposed_determinant = wp.zeros(ledger_count, dtype=float, device=self.device)
+            self._h5_guard_ledger_aggregate_alpha = wp.zeros(ledger_count, dtype=float, device=self.device)
+            self._h5_guard_ledger_nonlegacy_alpha = wp.zeros(ledger_count, dtype=float, device=self.device)
+            self._h5_guard_ledger_applied_determinant = wp.zeros(ledger_count, dtype=float, device=self.device)
+            self._h5_guard_ledger_pre_postcheck_aggregate_alpha = wp.zeros(
+                ledger_count, dtype=float, device=self.device
+            )
+            self._h5_guard_ledger_pre_postcheck_nonlegacy_alpha = wp.zeros(
+                ledger_count, dtype=float, device=self.device
+            )
+            self._h5_guard_ledger_pre_postcheck_applied_determinant = wp.zeros(
+                ledger_count, dtype=float, device=self.device
+            )
+            self._h5_guard_ledger_append_ordinal = wp.zeros(ledger_count, dtype=wp.int32, device=self.device)
+            self._h5_guard_ledger_reason_counts = wp.zeros(
+                H5_GUARD_LEDGER_REASON_COUNT, dtype=wp.int32, device=self.device
+            )
 
         self._positive_j_guard_reason_names = (
             "invalid_input",
@@ -1409,7 +1477,8 @@ class SolverVBD(SolverBase, CouplingInterface):
         prior = self._particle_constitutive_objective_audit_prior
         if snapshots is None or prior is None:
             raise RuntimeError("particle constitutive objective audit buffers are missing")
-        wp.copy(prior, state_in.particle_q)
+        prior.zero_()
+        self._reset_h5_guard_ledger()
         snapshots.zero_()
         for array in (
             self._particle_constitutive_objective_audit_row_valid,
@@ -1446,6 +1515,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         if not 0 <= int(pass_ordinal) < self._particle_constitutive_objective_audit_pass_count:
             raise RuntimeError("particle constitutive objective audit pass ordinal is malformed")
         snapshots = self._particle_constitutive_objective_audit_snapshots
+        prior = self._particle_constitutive_objective_audit_prior
         row_valid = self._particle_constitutive_objective_audit_row_valid
         solve_valid = self._particle_constitutive_objective_audit_solve_valid
         before = self._particle_constitutive_objective_audit_displacement_before
@@ -1453,6 +1523,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         applied = self._particle_constitutive_objective_audit_applied
         if (
             snapshots is None
+            or prior is None
             or row_valid is None
             or solve_valid is None
             or before is None
@@ -1518,6 +1589,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         if not self._particle_constitutive_objective_audit_capture_active:
             raise RuntimeError("particle constitutive objective audit capture is stale")
         snapshots = self._particle_constitutive_objective_audit_snapshots
+        prior = self._particle_constitutive_objective_audit_prior
         row_valid = self._particle_constitutive_objective_audit_row_valid
         solve_valid = self._particle_constitutive_objective_audit_solve_valid
         before = self._particle_constitutive_objective_audit_displacement_before
@@ -1525,6 +1597,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         applied = self._particle_constitutive_objective_audit_applied
         if (
             snapshots is None
+            or prior is None
             or row_valid is None
             or solve_valid is None
             or before is None
@@ -1549,6 +1622,99 @@ class SolverVBD(SolverBase, CouplingInterface):
             array_values(array, np.float32) for array in self._particle_constitutive_objective_audit_hessian
         ]
         vector_values = [array_values(array, np.float32) for array in (before, proposed, applied)]
+        prior_values = array_values(prior, np.float32)
+        if prior_values.shape != snapshot_values.shape[1:]:
+            raise RuntimeError("particle constitutive objective audit prior shape differs")
+        offsets = self._to_numpy(self.particle_adjacency.v_adj_tets_offsets, dtype=np.int64).reshape(-1)
+        pairs = self._to_numpy(self.particle_adjacency.v_adj_tets, dtype=np.int64).reshape(-1)
+        tet_indices = self._to_numpy(self.model.tet_indices, dtype=np.int64)
+        if (
+            offsets.shape != (int(self.model.particle_count) + 1,)
+            or pairs.ndim != 1
+            or pairs.size % 2 != 0
+            or int(offsets[-1]) != int(pairs.size)
+            or np.any(offsets < 0)
+            or np.any(offsets[1:] < offsets[:-1])
+            or tet_indices.shape != (int(self.model.tet_count), 4)
+        ):
+            raise RuntimeError("particle constitutive objective audit CSR shape is malformed")
+        csr_pairs = []
+        for particle in range(int(self.model.particle_count)):
+            start = int(offsets[particle])
+            end = int(offsets[particle + 1])
+            if start < 0 or end < start or end > pairs.size:
+                raise RuntimeError("particle constitutive objective audit CSR offsets are malformed")
+            for pair_index in range(start, end, 2):
+                tet_id = int(pairs[pair_index])
+                vertex_order = int(pairs[pair_index + 1])
+                if (
+                    tet_id < 0
+                    or tet_id >= int(self.model.tet_count)
+                    or vertex_order < 0
+                    or vertex_order >= 4
+                    or int(tet_indices[tet_id, vertex_order]) != particle
+                ):
+                    raise RuntimeError("particle constitutive objective audit CSR pair is malformed")
+                csr_pairs.append((particle, tet_id, vertex_order))
+
+        ledger_count = 0
+        ledger_overflow = False
+        ledger_records = []
+        ledger_reason_counts = {}
+        if self._h5_guard_ledger_capacity > 0:
+            count_values = self._to_numpy(self._h5_guard_ledger_event_count, dtype=np.int64).reshape(-1)
+            overflow_values = self._to_numpy(self._h5_guard_ledger_overflow, dtype=np.int32).reshape(-1)
+            if count_values.shape != (1,) or overflow_values.shape != (1,):
+                raise RuntimeError("particle constitutive objective audit guard ledger counters are malformed")
+            ledger_count = int(count_values[0])
+            ledger_overflow = bool(int(overflow_values[0]))
+            if ledger_count < 0:
+                raise RuntimeError("particle constitutive objective audit guard ledger count is malformed")
+            stored_count = min(ledger_count, int(self._h5_guard_ledger_capacity))
+            fields = {
+                "solver_step_epoch": self._h5_guard_ledger_solver_step_epoch,
+                "pass_ordinal": self._h5_guard_ledger_pass_ordinal,
+                "site": self._h5_guard_ledger_site,
+                "particle_id": self._h5_guard_ledger_particle_id,
+                "tet_id": self._h5_guard_ledger_tet_id,
+                "local_reason": self._h5_guard_ledger_local_reason,
+                "aggregate_decision": self._h5_guard_ledger_aggregate_decision,
+                "current_determinant_m3": self._h5_guard_ledger_current_determinant,
+                "determinant_floor_m3": self._h5_guard_ledger_floor,
+                "proposed_determinant_m3": self._h5_guard_ledger_proposed_determinant,
+                "aggregate_alpha": self._h5_guard_ledger_aggregate_alpha,
+                "nonlegacy_alpha": self._h5_guard_ledger_nonlegacy_alpha,
+                "applied_determinant_m3": self._h5_guard_ledger_applied_determinant,
+                "pre_postcheck_aggregate_alpha": self._h5_guard_ledger_pre_postcheck_aggregate_alpha,
+                "pre_postcheck_nonlegacy_alpha": self._h5_guard_ledger_pre_postcheck_nonlegacy_alpha,
+                "pre_postcheck_applied_determinant_m3": self._h5_guard_ledger_pre_postcheck_applied_determinant,
+                "append_ordinal": self._h5_guard_ledger_append_ordinal,
+            }
+            field_values = {
+                name: self._to_numpy(
+                    array, dtype=np.float64 if name.endswith("m3") or "alpha" in name else np.int64
+                ).reshape(-1)
+                for name, array in fields.items()
+            }
+            for _name, values in field_values.items():
+                if values.shape != (int(self._h5_guard_ledger_capacity),):
+                    raise RuntimeError("particle constitutive objective audit guard ledger field shape differs")
+                if not np.isfinite(values[:stored_count]).all():
+                    raise RuntimeError("particle constitutive objective audit guard ledger contains a nonfinite value")
+            for index in range(stored_count):
+                record = {
+                    name: (float(values[index]) if values.dtype.kind == "f" else int(values[index]))
+                    for name, values in field_values.items()
+                }
+                if record["aggregate_decision"] not in (0, 1):
+                    raise RuntimeError("particle constitutive objective audit guard ledger decision is malformed")
+                ledger_records.append(record)
+            reason_values = self._to_numpy(self._h5_guard_ledger_reason_counts, dtype=np.int64).reshape(-1)
+            if reason_values.shape != (H5_GUARD_LEDGER_REASON_COUNT,) or np.any(reason_values < 0):
+                raise RuntimeError("particle constitutive objective audit guard ledger reason counts are malformed")
+            ledger_reason_counts = {
+                reason: int(reason_values[index]) for index, reason in enumerate(self._positive_j_guard_reason_names)
+            }
         self._particle_constitutive_objective_audit_last_read_epoch = epoch
         self._particle_constitutive_objective_audit_capture_active = False
         return {
@@ -1576,6 +1742,25 @@ class SolverVBD(SolverBase, CouplingInterface):
             "displacement_before": vector_values[0].tolist(),
             "proposed_increment": vector_values[1].tolist(),
             "applied_increment": vector_values[2].tolist(),
+            "truth_plumbing_v2": {
+                "schema": "newton-vbd-particle-constitutive-objective-audit-truth-plumbing-v2",
+                "version": 2,
+                "probe_solver_epoch": epoch,
+                "pos_prev": prior_values.tolist(),
+                "snapshot0": snapshot_values[0].tolist(),
+                "pos_prev_snapshot0_relationship": "pos_prev_is_particle_q_prev_before_initializer; snapshot0_is_post_initializer_state",
+                "v_adj_tets_offsets": offsets.tolist(),
+                "v_adj_tets_pairs": [
+                    [int(particle), int(tet_id), int(vertex_order)] for particle, tet_id, vertex_order in csr_pairs
+                ],
+                "guard_ledger": {
+                    "count": ledger_count,
+                    "capacity": int(self._h5_guard_ledger_capacity),
+                    "overflow": ledger_overflow,
+                    "reason_counts": ledger_reason_counts,
+                    "records": ledger_records,
+                },
+            },
         }
 
     def _reset_particle_sweep_telemetry(self):
@@ -1640,6 +1825,83 @@ class SolverVBD(SolverBase, CouplingInterface):
             self._positive_j_guard_reason_counts,
             self._positive_j_guard_event_solver_step_epoch,
         ]
+
+    def _h5_guard_ledger_kernel_inputs(self) -> list[Any]:
+        """Return H5 ledger arguments, or inert typed placeholders when off."""
+        enabled = bool(
+            self._particle_constitutive_objective_audit_capture_active and self._h5_guard_ledger_capacity > 0
+        )
+        if enabled:
+            return [
+                True,
+                int(self._h5_guard_ledger_capacity),
+                self._h5_guard_ledger_event_count,
+                self._h5_guard_ledger_overflow,
+                self._h5_guard_ledger_solver_step_epoch,
+                self._h5_guard_ledger_pass_ordinal,
+                self._h5_guard_ledger_site,
+                self._h5_guard_ledger_particle_id,
+                self._h5_guard_ledger_tet_id,
+                self._h5_guard_ledger_local_reason,
+                self._h5_guard_ledger_aggregate_decision,
+                self._h5_guard_ledger_current_determinant,
+                self._h5_guard_ledger_floor,
+                self._h5_guard_ledger_proposed_determinant,
+                self._h5_guard_ledger_aggregate_alpha,
+                self._h5_guard_ledger_nonlegacy_alpha,
+                self._h5_guard_ledger_applied_determinant,
+                self._h5_guard_ledger_pre_postcheck_aggregate_alpha,
+                self._h5_guard_ledger_pre_postcheck_nonlegacy_alpha,
+                self._h5_guard_ledger_pre_postcheck_applied_determinant,
+                self._h5_guard_ledger_append_ordinal,
+                self._h5_guard_ledger_reason_counts,
+            ]
+        return [
+            False,
+            0,
+            self._positive_j_guard_event_ordinal,
+            self._positive_j_guard_reason_counts,
+            self._positive_j_guard_event_solver_step_epoch,
+            self._positive_j_guard_event_pass_ordinal,
+            self._positive_j_guard_event_site,
+            self._positive_j_guard_event_particle_id,
+            self._positive_j_guard_event_tet_id,
+            self._positive_j_guard_event_site,
+            self._positive_j_guard_event_decision,
+            self._positive_j_guard_event_current_determinant,
+            self._positive_j_guard_event_floor,
+            self._positive_j_guard_event_proposed_determinant,
+            self._positive_j_guard_event_alpha,
+            self._positive_j_guard_event_nonlegacy_alpha,
+            self._positive_j_guard_event_applied_determinant,
+            self._positive_j_guard_event_pre_postcheck_aggregate_alpha,
+            self._positive_j_guard_event_pre_postcheck_nonlegacy_alpha,
+            self._positive_j_guard_event_pre_postcheck_applied_determinant,
+            self._positive_j_guard_event_ordinal,
+            self._positive_j_guard_reason_counts,
+        ]
+
+    def _reset_h5_guard_ledger(self) -> None:
+        """Reset the fixed H5 ledger only for an active configured probe."""
+        if not self._particle_constitutive_objective_audit_capture_active:
+            return
+        arrays = (
+            self._h5_guard_ledger_event_count,
+            self._h5_guard_ledger_overflow,
+            self._h5_guard_ledger_reason_counts,
+        )
+        if any(array is None for array in arrays):
+            raise RuntimeError("particle constitutive objective audit guard ledger is missing")
+        wp.launch(
+            kernel=reset_h5_guard_ledger,
+            dim=H5_GUARD_LEDGER_REASON_COUNT,
+            inputs=[
+                self._h5_guard_ledger_event_count,
+                self._h5_guard_ledger_overflow,
+                self._h5_guard_ledger_reason_counts,
+            ],
+            device=self.device,
+        )
 
     def _capture_particle_active_set_cycle_state(self, particle_q, state_ordinal: int) -> None:
         if not self._particle_active_set_cycle_telemetry_enabled:
@@ -3064,6 +3326,11 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._initialize_rigid_bodies(state_in, control, contacts, dt, update_rigid)
         self._initialize_particles(state_in, state_out, dt)
         self._capture_particle_active_set_cycle_state(state_in.particle_q, 0)
+        if self._particle_constitutive_objective_audit_capture_active:
+            prior = self._particle_constitutive_objective_audit_prior
+            if prior is None:
+                raise RuntimeError("particle constitutive objective audit prior buffer is missing")
+            wp.copy(prior, self.particle_q_prev)
         self._capture_particle_constitutive_objective_audit_state(state_in.particle_q, 0)
 
         for iter_num in range(self.iterations):
@@ -3417,6 +3684,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self._positive_j_guard_event_pre_postcheck_applied_determinant,
                     self._positive_j_guard_reason_counts,
                     *self._particle_active_set_cycle_kernel_inputs(),
+                    *self._h5_guard_ledger_kernel_inputs(),
                 ],
                 outputs=[self.particle_displacements],
                 device=self.device,
@@ -4076,6 +4344,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self._positive_j_guard_event_pre_postcheck_applied_determinant,
                         self._positive_j_guard_reason_counts,
                         *self._particle_active_set_cycle_kernel_inputs(),
+                        *self._h5_guard_ledger_kernel_inputs(),
                     ],
                     outputs=[
                         self.particle_displacements,
@@ -4134,6 +4403,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self._positive_j_guard_event_pre_postcheck_applied_determinant,
                         self._positive_j_guard_reason_counts,
                         *self._particle_active_set_cycle_kernel_inputs(),
+                        *self._h5_guard_ledger_kernel_inputs(),
                     ],
                     outputs=[
                         self.particle_displacements,

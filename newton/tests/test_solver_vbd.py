@@ -4871,6 +4871,21 @@ def _test_vbd_particle_constitutive_objective_audit(test, device):
         test.assertTrue(
             all(np.isfinite(np.asarray(payload[name])).all() for name in ("snapshots", "total_force", "total_hessian"))
         )
+        truth = payload["truth_plumbing_v2"]
+        test.assertEqual(truth["version"], 2)
+        test.assertEqual(truth["probe_solver_epoch"], 1)
+        test.assertEqual(
+            truth["pos_prev_snapshot0_relationship"],
+            "pos_prev_is_particle_q_prev_before_initializer; snapshot0_is_post_initializer_state",
+        )
+        test.assertEqual(np.asarray(truth["pos_prev"]).shape, (4, 3))
+        test.assertEqual(np.asarray(truth["snapshot0"]).shape, (4, 3))
+        test.assertEqual(np.asarray(truth["v_adj_tets_offsets"]).shape, (5,))
+        test.assertEqual(np.asarray(truth["v_adj_tets_pairs"]).shape[1], 3)
+        ledger = truth["guard_ledger"]
+        test.assertFalse(ledger["overflow"])
+        test.assertEqual(ledger["count"], len(ledger["records"]))
+        test.assertEqual(sum(ledger["reason_counts"].values()), ledger["count"])
         with test.assertRaises(RuntimeError):
             solver.read_particle_constitutive_objective_audit_telemetry()
 
