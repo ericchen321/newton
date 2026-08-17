@@ -67,6 +67,7 @@ POSITIVE_J_GUARD_SITE_INITIALIZER = 0
 POSITIVE_J_GUARD_SITE_TILE = 1
 POSITIVE_J_GUARD_SITE_SCALAR = 2
 POSITIVE_J_GUARD_EVENT_ORDINAL_MAX = 2**31 - 1
+PARTICLE_ACTIVE_SET_CYCLE_REASON_COUNT = POSITIVE_J_GUARD_REASON_COUNT
 
 
 @wp.kernel
@@ -111,6 +112,17 @@ def reduce_particle_sweep_position_update(
         wp.atomic_min(finite, iteration, wp.int32(0))
         return
     wp.atomic_max(max_particle_position_update_m, iteration, update)
+
+
+@wp.kernel
+def capture_particle_active_set_cycle_state(
+    particle_q: wp.array[wp.vec3],
+    state_matrix: wp.array2d[wp.vec3],
+    state_ordinal: int,
+):
+    """Copy one complete float32 particle state into the fixed H3 matrix."""
+    particle = wp.tid()
+    state_matrix[state_ordinal, particle] = particle_q[particle]
 
 
 class mat32(wp.types.matrix(shape=(3, 2), dtype=wp.float32)):
@@ -1633,6 +1645,8 @@ def _record_positive_j_guard_event(
     event_pre_postcheck_applied_determinant: wp.array[float],
     reason_counts: wp.array[wp.int32],
 ):
+    if event_ordinal.shape[0] == 0:
+        return
     slot = tet_index * POSITIVE_J_GUARD_REASON_COUNT + reason
     ordinal = pass_ordinal * particle_count + particle_index
     previous = wp.atomic_min(event_ordinal, slot, ordinal)
@@ -1653,6 +1667,43 @@ def _record_positive_j_guard_event(
         event_pre_postcheck_nonlegacy_alpha[slot] = pre_postcheck_nonlegacy_alpha
         event_pre_postcheck_applied_determinant[slot] = pre_postcheck_applied_determinant
     wp.atomic_add(reason_counts, reason, 1)
+
+
+@wp.func
+def _record_particle_active_set_cycle_event(
+    tet_index: wp.int32,
+    particle_index: wp.int32,
+    local_reason: int,
+    aggregate_decision: wp.int32,
+    postcheck_rejected: wp.int32,
+    pass_ordinal: int,
+    event_capacity: int,
+    enabled: bool,
+    event_counts: wp.array[wp.int32],
+    event_tet_ids: wp.array[wp.int32],
+    event_particle_ids: wp.array[wp.int32],
+    event_local_reasons: wp.array[wp.int32],
+    event_decisions: wp.array[wp.int32],
+    event_postcheck_rejected: wp.array[wp.int32],
+    reason_counts: wp.array[wp.int32],
+    overflow: wp.array[wp.int32],
+):
+    """Append one exact guard event to the independent H3 pass log."""
+    if not enabled:
+        return
+    if pass_ordinal < 0 or pass_ordinal >= event_counts.shape[0] or event_capacity <= 0:
+        return
+    ordinal = wp.atomic_add(event_counts, pass_ordinal, 1)
+    wp.atomic_add(reason_counts, pass_ordinal * PARTICLE_ACTIVE_SET_CYCLE_REASON_COUNT + local_reason, 1)
+    if ordinal >= event_capacity:
+        wp.atomic_min(overflow, pass_ordinal, wp.int32(1))
+        return
+    slot = pass_ordinal * event_capacity + ordinal
+    event_tet_ids[slot] = tet_index
+    event_particle_ids[slot] = particle_index
+    event_local_reasons[slot] = local_reason
+    event_decisions[slot] = aggregate_decision
+    event_postcheck_rejected[slot] = postcheck_rejected
 
 
 @wp.func
@@ -1687,6 +1738,16 @@ def _guard_vbd_displacement_increment(
     event_pre_postcheck_nonlegacy_alpha: wp.array[float],
     event_pre_postcheck_applied_determinant: wp.array[float],
     reason_counts: wp.array[wp.int32],
+    active_set_cycle_enabled: bool,
+    active_set_cycle_event_capacity: int,
+    active_set_cycle_event_counts: wp.array[wp.int32],
+    active_set_cycle_event_tet_ids: wp.array[wp.int32],
+    active_set_cycle_event_particle_ids: wp.array[wp.int32],
+    active_set_cycle_event_local_reasons: wp.array[wp.int32],
+    active_set_cycle_event_decisions: wp.array[wp.int32],
+    active_set_cycle_event_postcheck_rejected: wp.array[wp.int32],
+    active_set_cycle_reason_counts: wp.array[wp.int32],
+    active_set_cycle_overflow: wp.array[wp.int32],
 ):
     """Keep one colored vertex increment above the incident tet determinant floor."""
     relative_floor_fraction = 1.0e-4
@@ -1876,7 +1937,7 @@ def _guard_vbd_displacement_increment(
             ):
                 postcheck_invalid = 1
 
-    if telemetry_enabled:
+    if telemetry_enabled or active_set_cycle_enabled:
         # Record local reasons with the final decision, while preserving the
         # analytic aggregate and same-tet determinant before the postcheck.
         for adjacent_tet in range(get_vertex_num_adjacent_tets(particle_adjacency, particle_index)):
@@ -1999,7 +2060,7 @@ def _guard_vbd_displacement_increment(
             ):
                 finalcheck_invalid = 1
 
-            if reason >= 0:
+            if reason >= 0 and (telemetry_enabled or active_set_cycle_enabled):
                 _record_positive_j_guard_event(
                     reason,
                     site,
@@ -2035,7 +2096,25 @@ def _guard_vbd_displacement_increment(
                     event_pre_postcheck_applied_determinant,
                     reason_counts,
                 )
-            if postcheck_invalid != 0 and local_invalid == 0 and (precheck_invalid != 0 or finalcheck_invalid != 0):
+                _record_particle_active_set_cycle_event(
+                    tet_index,
+                    particle_index,
+                    reason,
+                    wp.int32(alpha > 0.0),
+                    wp.int32(0),
+                    pass_ordinal,
+                    active_set_cycle_event_capacity,
+                    active_set_cycle_enabled,
+                    active_set_cycle_event_counts,
+                    active_set_cycle_event_tet_ids,
+                    active_set_cycle_event_particle_ids,
+                    active_set_cycle_event_local_reasons,
+                    active_set_cycle_event_decisions,
+                    active_set_cycle_event_postcheck_rejected,
+                    active_set_cycle_reason_counts,
+                    active_set_cycle_overflow,
+                )
+            if postcheck_invalid != 0 and local_invalid == 0 and (precheck_invalid != 0 or finalcheck_invalid != 0) and (telemetry_enabled or active_set_cycle_enabled):
                 _record_positive_j_guard_event(
                     POSITIVE_J_GUARD_REASON_INVALID_INPUT,
                     site,
@@ -2071,7 +2150,25 @@ def _guard_vbd_displacement_increment(
                     event_pre_postcheck_applied_determinant,
                     reason_counts,
                 )
-            if postcheck_invalid == 0 and precheck_miss != 0:
+                _record_particle_active_set_cycle_event(
+                    tet_index,
+                    particle_index,
+                    POSITIVE_J_GUARD_REASON_INVALID_INPUT,
+                    wp.int32(alpha > 0.0),
+                    wp.int32(0),
+                    pass_ordinal,
+                    active_set_cycle_event_capacity,
+                    active_set_cycle_enabled,
+                    active_set_cycle_event_counts,
+                    active_set_cycle_event_tet_ids,
+                    active_set_cycle_event_particle_ids,
+                    active_set_cycle_event_local_reasons,
+                    active_set_cycle_event_decisions,
+                    active_set_cycle_event_postcheck_rejected,
+                    active_set_cycle_reason_counts,
+                    active_set_cycle_overflow,
+                )
+            if postcheck_invalid == 0 and precheck_miss != 0 and (telemetry_enabled or active_set_cycle_enabled):
                 _record_positive_j_guard_event(
                     POSITIVE_J_GUARD_REASON_APPLIED_POSTCHECK_REJECT,
                     site,
@@ -2106,6 +2203,24 @@ def _guard_vbd_displacement_increment(
                     event_pre_postcheck_nonlegacy_alpha,
                     event_pre_postcheck_applied_determinant,
                     reason_counts,
+                )
+                _record_particle_active_set_cycle_event(
+                    tet_index,
+                    particle_index,
+                    POSITIVE_J_GUARD_REASON_APPLIED_POSTCHECK_REJECT,
+                    wp.int32(alpha > 0.0),
+                    wp.int32(1),
+                    pass_ordinal,
+                    active_set_cycle_event_capacity,
+                    active_set_cycle_enabled,
+                    active_set_cycle_event_counts,
+                    active_set_cycle_event_tet_ids,
+                    active_set_cycle_event_particle_ids,
+                    active_set_cycle_event_local_reasons,
+                    active_set_cycle_event_decisions,
+                    active_set_cycle_event_postcheck_rejected,
+                    active_set_cycle_reason_counts,
+                    active_set_cycle_overflow,
                 )
 
     if alpha == 1.0:
@@ -2145,6 +2260,16 @@ def apply_guarded_particle_displacements(
     event_pre_postcheck_nonlegacy_alpha: wp.array[float],
     event_pre_postcheck_applied_determinant: wp.array[float],
     reason_counts: wp.array[wp.int32],
+    active_set_cycle_enabled: bool,
+    active_set_cycle_event_capacity: int,
+    active_set_cycle_event_counts: wp.array[wp.int32],
+    active_set_cycle_event_tet_ids: wp.array[wp.int32],
+    active_set_cycle_event_particle_ids: wp.array[wp.int32],
+    active_set_cycle_event_local_reasons: wp.array[wp.int32],
+    active_set_cycle_event_decisions: wp.array[wp.int32],
+    active_set_cycle_event_postcheck_rejected: wp.array[wp.int32],
+    active_set_cycle_reason_counts: wp.array[wp.int32],
+    active_set_cycle_overflow: wp.array[wp.int32],
     particle_displacements: wp.array[wp.vec3],
 ):
     """Apply one already-truncated color group through the positive-J guard."""
@@ -2182,6 +2307,16 @@ def apply_guarded_particle_displacements(
         event_pre_postcheck_nonlegacy_alpha,
         event_pre_postcheck_applied_determinant,
         reason_counts,
+        active_set_cycle_enabled,
+        active_set_cycle_event_capacity,
+        active_set_cycle_event_counts,
+        active_set_cycle_event_tet_ids,
+        active_set_cycle_event_particle_ids,
+        active_set_cycle_event_local_reasons,
+        active_set_cycle_event_decisions,
+        active_set_cycle_event_postcheck_rejected,
+        active_set_cycle_reason_counts,
+        active_set_cycle_overflow,
     )
     particle_displacements[particle_index] = guarded_displacement
     pos[particle_index] = pos[particle_index] + guarded_displacement
@@ -3169,6 +3304,16 @@ def solve_elasticity_tile(
     event_pre_postcheck_nonlegacy_alpha: wp.array[float],
     event_pre_postcheck_applied_determinant: wp.array[float],
     reason_counts: wp.array[wp.int32],
+    active_set_cycle_enabled: bool,
+    active_set_cycle_event_capacity: int,
+    active_set_cycle_event_counts: wp.array[wp.int32],
+    active_set_cycle_event_tet_ids: wp.array[wp.int32],
+    active_set_cycle_event_particle_ids: wp.array[wp.int32],
+    active_set_cycle_event_local_reasons: wp.array[wp.int32],
+    active_set_cycle_event_decisions: wp.array[wp.int32],
+    active_set_cycle_event_postcheck_rejected: wp.array[wp.int32],
+    active_set_cycle_reason_counts: wp.array[wp.int32],
+    active_set_cycle_overflow: wp.array[wp.int32],
     # output
     particle_displacements: wp.array[wp.vec3],
 ):
@@ -3340,6 +3485,16 @@ def solve_elasticity_tile(
                 event_pre_postcheck_nonlegacy_alpha,
                 event_pre_postcheck_applied_determinant,
                 reason_counts,
+                active_set_cycle_enabled,
+                active_set_cycle_event_capacity,
+                active_set_cycle_event_counts,
+                active_set_cycle_event_tet_ids,
+                active_set_cycle_event_particle_ids,
+                active_set_cycle_event_local_reasons,
+                active_set_cycle_event_decisions,
+                active_set_cycle_event_postcheck_rejected,
+                active_set_cycle_reason_counts,
+                active_set_cycle_overflow,
             )
 
 
@@ -3389,6 +3544,16 @@ def solve_elasticity(
     event_pre_postcheck_nonlegacy_alpha: wp.array[float],
     event_pre_postcheck_applied_determinant: wp.array[float],
     reason_counts: wp.array[wp.int32],
+    active_set_cycle_enabled: bool,
+    active_set_cycle_event_capacity: int,
+    active_set_cycle_event_counts: wp.array[wp.int32],
+    active_set_cycle_event_tet_ids: wp.array[wp.int32],
+    active_set_cycle_event_particle_ids: wp.array[wp.int32],
+    active_set_cycle_event_local_reasons: wp.array[wp.int32],
+    active_set_cycle_event_decisions: wp.array[wp.int32],
+    active_set_cycle_event_postcheck_rejected: wp.array[wp.int32],
+    active_set_cycle_reason_counts: wp.array[wp.int32],
+    active_set_cycle_overflow: wp.array[wp.int32],
     # output
     particle_displacements: wp.array[wp.vec3],
 ):
@@ -3537,6 +3702,16 @@ def solve_elasticity(
             event_pre_postcheck_nonlegacy_alpha,
             event_pre_postcheck_applied_determinant,
             reason_counts,
+            active_set_cycle_enabled,
+            active_set_cycle_event_capacity,
+            active_set_cycle_event_counts,
+            active_set_cycle_event_tet_ids,
+            active_set_cycle_event_particle_ids,
+            active_set_cycle_event_local_reasons,
+            active_set_cycle_event_decisions,
+            active_set_cycle_event_postcheck_rejected,
+            active_set_cycle_reason_counts,
+            active_set_cycle_overflow,
         )
 
 

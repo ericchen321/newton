@@ -37,11 +37,13 @@ from .particle_vbd_kernels import (
     POSITIVE_J_GUARD_SITE_INITIALIZER,
     POSITIVE_J_GUARD_SITE_SCALAR,
     POSITIVE_J_GUARD_SITE_TILE,
+    PARTICLE_ACTIVE_SET_CYCLE_REASON_COUNT,
     TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
     # Topological filtering helper functions
     accumulate_particle_body_contact_force_and_hessian,
     accumulate_self_contact_force_and_hessian,
     accumulate_spring_force_and_hessian,
+    capture_particle_active_set_cycle_state,
     # Planar DAT (Divide and Truncate) kernels
     apply_guarded_particle_displacements,
     apply_planar_truncation_parallel_by_collision,
@@ -302,6 +304,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         particle_positive_j_guard_policy: str = "legacy",
         particle_positive_j_guard_telemetry: bool = False,
         particle_sweep_telemetry: bool = False,
+        particle_active_set_cycle_telemetry: bool = False,
         # Rigid body - constraint formulation and stabilization
         rigid_compliant_alm: bool | None = None,  # None retains legacy and emits the scoped migration warning
         rigid_avbd_alpha: float | None = None,  # Shared alpha override; None uses mode defaults
@@ -361,6 +364,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             particle_edge_parallel_epsilon: Threshold to detect near-parallel edges in edge-edge collision handling.
             particle_enable_tile_solve: Whether to accelerate the particle solver using tile API.
             particle_sweep_telemetry: Whether to retain passive per-iteration complete-sweep particle update telemetry.
+            particle_active_set_cycle_telemetry: Whether to retain passive per-sweep positive-J active-set cycle telemetry.
             particle_topological_contact_filter_threshold: Maximum topological distance (measured in rings) under which candidate
                 self-contacts are discarded. Set to a higher value to tolerate contacts between more closely connected mesh
                 elements. Only used when `particle_enable_self_contact` is `True`. Note that setting this to a value larger than 3 will
@@ -530,6 +534,8 @@ class SolverVBD(SolverBase, CouplingInterface):
             raise TypeError("particle_positive_j_guard_telemetry must be a bool")
         if type(particle_sweep_telemetry) is not bool:
             raise TypeError("particle_sweep_telemetry must be a bool")
+        if type(particle_active_set_cycle_telemetry) is not bool:
+            raise TypeError("particle_active_set_cycle_telemetry must be a bool")
 
         integrates_rigid_bodies = model.body_count > 0 and not integrate_with_external_rigid_solver
 
@@ -621,6 +627,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         self.particle_positive_j_guard_policy_code = int(particle_positive_j_guard_policy == "recovery")
         self.particle_positive_j_guard_telemetry = particle_positive_j_guard_telemetry
         self.particle_sweep_telemetry = particle_sweep_telemetry
+        self.particle_active_set_cycle_telemetry = particle_active_set_cycle_telemetry
         self._joint_mode_deprecation_warned = False
 
         # Rigid integration mode: when True, rigid bodies are integrated by an external
@@ -704,6 +711,42 @@ class SolverVBD(SolverBase, CouplingInterface):
             self._particle_sweep_particle_q = wp.zeros_like(model.particle_q, device=self.device)
             self._particle_sweep_max_update = wp.zeros(self.iterations, dtype=float, device=self.device)
             self._particle_sweep_finite = wp.zeros(self.iterations, dtype=wp.int32, device=self.device)
+
+        self._particle_active_set_cycle_telemetry_enabled = bool(
+            self.particle_active_set_cycle_telemetry and model.particle_count > 0 and model.tet_count > 0
+        )
+        self._particle_active_set_cycle_states = None
+        self._particle_active_set_cycle_event_capacity = 0
+        self._particle_active_set_cycle_event_counts = None
+        self._particle_active_set_cycle_event_tet_ids = None
+        self._particle_active_set_cycle_event_particle_ids = None
+        self._particle_active_set_cycle_event_local_reasons = None
+        self._particle_active_set_cycle_event_decisions = None
+        self._particle_active_set_cycle_event_postcheck_rejected = None
+        self._particle_active_set_cycle_reason_counts = None
+        self._particle_active_set_cycle_overflow = None
+        self._particle_active_set_cycle_observer = None
+        if self._particle_active_set_cycle_telemetry_enabled:
+            color_group_count = len(model.particle_color_groups)
+            pass_count = color_group_count * (int(self.iterations) + 1)
+            event_capacity = 2 * 4 * int(model.tet_count)
+            if color_group_count <= 0 or pass_count <= 0 or event_capacity <= 0:
+                raise ValueError("particle active-set cycle telemetry metadata is malformed")
+            self._particle_active_set_cycle_states = wp.zeros(
+                (int(self.iterations) + 1, int(model.particle_count)), dtype=wp.vec3, device=self.device
+            )
+            self._particle_active_set_cycle_event_capacity = event_capacity
+            total_events = pass_count * event_capacity
+            self._particle_active_set_cycle_event_counts = wp.zeros(pass_count, dtype=wp.int32, device=self.device)
+            self._particle_active_set_cycle_event_tet_ids = wp.zeros(total_events, dtype=wp.int32, device=self.device)
+            self._particle_active_set_cycle_event_particle_ids = wp.zeros(total_events, dtype=wp.int32, device=self.device)
+            self._particle_active_set_cycle_event_local_reasons = wp.zeros(total_events, dtype=wp.int32, device=self.device)
+            self._particle_active_set_cycle_event_decisions = wp.zeros(total_events, dtype=wp.int32, device=self.device)
+            self._particle_active_set_cycle_event_postcheck_rejected = wp.zeros(total_events, dtype=wp.int32, device=self.device)
+            self._particle_active_set_cycle_reason_counts = wp.zeros(
+                pass_count * PARTICLE_ACTIVE_SET_CYCLE_REASON_COUNT, dtype=wp.int32, device=self.device
+            )
+            self._particle_active_set_cycle_overflow = wp.zeros(pass_count, dtype=wp.int32, device=self.device)
 
         self._positive_j_guard_reason_names = (
             "invalid_input",
@@ -1122,6 +1165,132 @@ class SolverVBD(SolverBase, CouplingInterface):
             "finite": [bool(value) for value in flags],
         }
 
+    def register_particle_active_set_cycle_observer(self, observer) -> None:
+        """Register the worker-local consumer for one private H3 state readback."""
+        if not self._particle_active_set_cycle_telemetry_enabled:
+            if observer is not None:
+                raise RuntimeError("particle active-set cycle telemetry is disabled")
+            self._particle_active_set_cycle_observer = None
+            return
+        if not callable(observer):
+            raise TypeError("particle active-set cycle observer must be callable")
+        self._particle_active_set_cycle_observer = observer
+
+    def read_particle_active_set_cycle_telemetry(self):
+        """Deliver private float32 sweep states to the registered worker observer."""
+        if not self._particle_active_set_cycle_telemetry_enabled:
+            return None
+        states = self._particle_active_set_cycle_states
+        observer = self._particle_active_set_cycle_observer
+        if states is None or observer is None:
+            raise RuntimeError("particle active-set cycle state observer is not registered")
+        expected_shape = (int(self.iterations) + 1, int(self.model.particle_count), 3)
+        values = self._to_numpy(states, dtype=np.float32)
+        if tuple(values.shape) != expected_shape:
+            raise RuntimeError("particle active-set cycle state buffer shape differs")
+        if not np.isfinite(values).all():
+            raise RuntimeError("particle active-set cycle state buffer contains a nonfinite value")
+        try:
+            return observer(values)
+        finally:
+            del values
+
+    def read_particle_active_set_cycle_events(self):
+        """Read and validate exact H3 pass records for the just-completed step."""
+        if not self._particle_active_set_cycle_telemetry_enabled:
+            return None
+        color_group_count = len(self.model.particle_color_groups)
+        iterations = int(self.iterations)
+        pass_count = color_group_count * (iterations + 1)
+        tet_count = int(self.model.tet_count)
+        particle_count = int(self.model.particle_count)
+        capacity = int(self._particle_active_set_cycle_event_capacity)
+        event_counts = self._particle_active_set_cycle_event_counts
+        tet_ids_array = self._particle_active_set_cycle_event_tet_ids
+        particle_ids_array = self._particle_active_set_cycle_event_particle_ids
+        reasons_array = self._particle_active_set_cycle_event_local_reasons
+        decisions_array = self._particle_active_set_cycle_event_decisions
+        postcheck_array = self._particle_active_set_cycle_event_postcheck_rejected
+        reason_counts_array = self._particle_active_set_cycle_reason_counts
+        overflow_array = self._particle_active_set_cycle_overflow
+        arrays = (
+            event_counts,
+            tet_ids_array,
+            particle_ids_array,
+            reasons_array,
+            decisions_array,
+            postcheck_array,
+            reason_counts_array,
+            overflow_array,
+        )
+        if any(array is None for array in arrays):
+            raise RuntimeError("particle active-set cycle telemetry buffers are missing")
+        if tuple(event_counts.shape) != (pass_count,) or tuple(overflow_array.shape) != (pass_count,):
+            raise RuntimeError("particle active-set cycle pass buffer shape differs")
+        if tuple(reason_counts_array.shape) != (pass_count * PARTICLE_ACTIVE_SET_CYCLE_REASON_COUNT,):
+            raise RuntimeError("particle active-set cycle reason buffer shape differs")
+        if tuple(tet_ids_array.shape) != (pass_count * capacity,):
+            raise RuntimeError("particle active-set cycle event buffer shape differs")
+        counts = self._to_numpy(event_counts, dtype=np.int64).reshape(-1)
+        overflows = self._to_numpy(overflow_array, dtype=np.int32).reshape(-1)
+        tet_ids = self._to_numpy(tet_ids_array, dtype=np.int64).reshape(-1)
+        particle_ids = self._to_numpy(particle_ids_array, dtype=np.int64).reshape(-1)
+        reasons = self._to_numpy(reasons_array, dtype=np.int64).reshape(-1)
+        decisions = self._to_numpy(decisions_array, dtype=np.int64).reshape(-1)
+        postchecks = self._to_numpy(postcheck_array, dtype=np.int64).reshape(-1)
+        reason_counts = self._to_numpy(reason_counts_array, dtype=np.int64).reshape(-1)
+        if (
+            counts.shape != (pass_count,)
+            or overflows.shape != (pass_count,)
+            or any(values.shape != (pass_count * capacity,) for values in (tet_ids, particle_ids, reasons, decisions, postchecks))
+            or reason_counts.shape != (pass_count * PARTICLE_ACTIVE_SET_CYCLE_REASON_COUNT,)
+        ):
+            raise RuntimeError("particle active-set cycle telemetry readback lengths differ")
+        if np.any(overflows != 0) or np.any(counts < 0) or np.any(counts > capacity):
+            raise OverflowError("particle active-set cycle telemetry event capacity overflow")
+        passes = []
+        for pass_ordinal in range(pass_count):
+            count = int(counts[pass_ordinal])
+            start = pass_ordinal * capacity
+            records = []
+            identities = set()
+            for offset in range(count):
+                slot = start + offset
+                tet_id = int(tet_ids[slot])
+                particle_id = int(particle_ids[slot])
+                local_reason = int(reasons[slot])
+                decision = int(decisions[slot])
+                postcheck_rejected = int(postchecks[slot])
+                if not 0 <= tet_id < tet_count or not 0 <= particle_id < particle_count:
+                    raise RuntimeError("particle active-set cycle event index is out of range")
+                if not 0 <= local_reason < PARTICLE_ACTIVE_SET_CYCLE_REASON_COUNT or decision not in (0, 1) or postcheck_rejected not in (0, 1):
+                    raise RuntimeError("particle active-set cycle event tuple is malformed")
+                if postcheck_rejected != int(local_reason == 5):
+                    raise RuntimeError("particle active-set cycle postcheck flag is malformed")
+                identity = (tet_id, particle_id, local_reason, postcheck_rejected)
+                if identity in identities:
+                    raise RuntimeError("particle active-set cycle event identity is duplicated")
+                identities.add(identity)
+                records.append((tet_id, particle_id, local_reason, decision, postcheck_rejected))
+            records.sort()
+            expected_counts = reason_counts[
+                pass_ordinal * PARTICLE_ACTIVE_SET_CYCLE_REASON_COUNT : (pass_ordinal + 1) * PARTICLE_ACTIVE_SET_CYCLE_REASON_COUNT
+            ]
+            if any(int(value) < 0 for value in expected_counts) or int(np.sum(expected_counts)) != count:
+                raise RuntimeError("particle active-set cycle reason counts do not reconcile")
+            passes.append({"pass_ordinal": pass_ordinal, "reason_counts": [int(value) for value in expected_counts], "records": records})
+        return {
+            "schema": "newton-vbd-particle-active-set-cycle-telemetry-v1",
+            "telemetry_enabled": True,
+            "particle_count": particle_count,
+            "tet_count": tet_count,
+            "particle_color_group_count": color_group_count,
+            "iterations": iterations,
+            "pass_count": pass_count,
+            "event_capacity": capacity,
+            "passes": passes,
+        }
+
     def _reset_particle_sweep_telemetry(self):
         if not self._particle_sweep_telemetry_enabled:
             return
@@ -1135,6 +1304,61 @@ class SolverVBD(SolverBase, CouplingInterface):
             kernel=reset_particle_sweep_telemetry,
             dim=int(self.iterations),
             inputs=[max_update, finite],
+            device=self.device,
+        )
+
+    def _reset_particle_active_set_cycle_telemetry(self):
+        if not self._particle_active_set_cycle_telemetry_enabled:
+            return
+        event_counts = self._particle_active_set_cycle_event_counts
+        reason_counts = self._particle_active_set_cycle_reason_counts
+        overflow = self._particle_active_set_cycle_overflow
+        if event_counts is None or reason_counts is None or overflow is None:
+            raise RuntimeError("particle active-set cycle telemetry buffers are missing")
+        event_counts.zero_()
+        reason_counts.zero_()
+        overflow.zero_()
+
+    def _particle_active_set_cycle_kernel_inputs(self) -> list[Any]:
+        """Return H3 kernel arguments without allocating when the feature is off."""
+        if self._particle_active_set_cycle_telemetry_enabled:
+            return [
+                True,
+                int(self._particle_active_set_cycle_event_capacity),
+                self._particle_active_set_cycle_event_counts,
+                self._particle_active_set_cycle_event_tet_ids,
+                self._particle_active_set_cycle_event_particle_ids,
+                self._particle_active_set_cycle_event_local_reasons,
+                self._particle_active_set_cycle_event_decisions,
+                self._particle_active_set_cycle_event_postcheck_rejected,
+                self._particle_active_set_cycle_reason_counts,
+                self._particle_active_set_cycle_overflow,
+            ]
+        # Existing positive-J arrays are type-compatible inert arguments.  The
+        # device helper returns before touching them while H3 is disabled.
+        return [
+            False,
+            0,
+            self._positive_j_guard_event_ordinal,
+            self._positive_j_guard_event_tet_id,
+            self._positive_j_guard_event_particle_id,
+            self._positive_j_guard_event_site,
+            self._positive_j_guard_event_decision,
+            self._positive_j_guard_event_pass_ordinal,
+            self._positive_j_guard_reason_counts,
+            self._positive_j_guard_event_solver_step_epoch,
+        ]
+
+    def _capture_particle_active_set_cycle_state(self, particle_q, state_ordinal: int) -> None:
+        if not self._particle_active_set_cycle_telemetry_enabled:
+            return
+        states = self._particle_active_set_cycle_states
+        if states is None or not 0 <= int(state_ordinal) <= int(self.iterations):
+            raise RuntimeError("particle active-set cycle state capture ordinal is malformed")
+        wp.launch(
+            kernel=capture_particle_active_set_cycle_state,
+            dim=int(self.model.particle_count),
+            inputs=[particle_q, states, int(state_ordinal)],
             device=self.device,
         )
 
@@ -2536,6 +2760,7 @@ class SolverVBD(SolverBase, CouplingInterface):
         self._apply_module_options()
         self._advance_positive_j_guard_step_epoch()
         self._reset_particle_sweep_telemetry()
+        self._reset_particle_active_set_cycle_telemetry()
         self._reset_positive_j_guard_telemetry()
         update_rigid = self._update_rigid_history
         self._update_rigid_history = True
@@ -2545,6 +2770,7 @@ class SolverVBD(SolverBase, CouplingInterface):
 
         self._initialize_rigid_bodies(state_in, control, contacts, dt, update_rigid)
         self._initialize_particles(state_in, state_out, dt)
+        self._capture_particle_active_set_cycle_state(state_in.particle_q, 0)
 
         for iter_num in range(self.iterations):
             self._solve_rigid_body_iteration(state_in, state_out, control, contacts, dt)
@@ -2569,6 +2795,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     ],
                     device=self.device,
                 )
+            self._capture_particle_active_set_cycle_state(state_in.particle_q, iter_num + 1)
 
         # Snapshot solved rigid contact state for next-frame warm-start.
         self._snapshot_rigid_contact_history(contacts)
@@ -2895,6 +3122,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                     self._positive_j_guard_event_pre_postcheck_nonlegacy_alpha,
                     self._positive_j_guard_event_pre_postcheck_applied_determinant,
                     self._positive_j_guard_reason_counts,
+                    *self._particle_active_set_cycle_kernel_inputs(),
                 ],
                 outputs=[self.particle_displacements],
                 device=self.device,
@@ -3553,6 +3781,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self._positive_j_guard_event_pre_postcheck_nonlegacy_alpha,
                         self._positive_j_guard_event_pre_postcheck_applied_determinant,
                         self._positive_j_guard_reason_counts,
+                        *self._particle_active_set_cycle_kernel_inputs(),
                     ],
                     outputs=[
                         self.particle_displacements,
@@ -3610,6 +3839,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                         self._positive_j_guard_event_pre_postcheck_nonlegacy_alpha,
                         self._positive_j_guard_event_pre_postcheck_applied_determinant,
                         self._positive_j_guard_reason_counts,
+                        *self._particle_active_set_cycle_kernel_inputs(),
                     ],
                     outputs=[
                         self.particle_displacements,

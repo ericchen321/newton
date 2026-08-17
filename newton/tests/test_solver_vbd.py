@@ -4743,6 +4743,80 @@ def _test_vbd_particle_sweep_telemetry(test, device):
         test.assertAlmostEqual(telemetry["max_particle_position_update_m"][0], expected, places=6)
 
 
+def _test_vbd_particle_active_set_cycle_telemetry(test, device):
+    """Verify exact passive H3 states and per-pass active-set records."""
+    disabled_model = _round6_solver_model(device)
+    disabled = newton.solvers.SolverVBD(
+        disabled_model,
+        iterations=1,
+        particle_enable_tile_solve=device.is_cuda,
+        particle_collision_detection_interval=-1,
+    )
+    test.assertIsNone(disabled.read_particle_active_set_cycle_telemetry())
+    test.assertIsNone(disabled.read_particle_active_set_cycle_events())
+    with test.assertRaises(TypeError):
+        newton.solvers.SolverVBD(disabled_model, particle_active_set_cycle_telemetry=1)
+
+    def run(enabled, tile_solve):
+        model = _round6_solver_model(device)
+        solver = newton.solvers.SolverVBD(
+            model,
+            iterations=2,
+            particle_enable_tile_solve=tile_solve,
+            particle_collision_detection_interval=-1,
+            particle_active_set_cycle_telemetry=enabled,
+        )
+        observed = []
+        if enabled:
+            solver.register_particle_active_set_cycle_observer(lambda states: observed.append(states.copy()) or None)
+        state_in, state_out = model.state(), model.state()
+        initial = model.particle_q.numpy().copy()
+        initial[0, 2] = 0.9
+        state_in.particle_q.assign(initial.astype(np.float32))
+        state_in.particle_qd.zero_()
+        before = state_in.particle_q.numpy().copy()
+        solver.step(state_in, state_out, model.control(clone_variables=False), None, 0.01)
+        after = state_out.particle_q.numpy().copy()
+        if enabled:
+            payload = solver.read_particle_active_set_cycle_telemetry()
+            events = solver.read_particle_active_set_cycle_events()
+        else:
+            payload = None
+            events = None
+        return after, before, observed, payload, events, solver
+
+    for tile_solve in (False, True) if device.is_cuda else (False,):
+        off_output, _before, _observed, off_payload, off_events, _off_solver = run(False, tile_solve)
+        on_output, before, observed, payload, events, solver = run(True, tile_solve)
+        test.assertIsNone(off_payload)
+        test.assertIsNone(off_events)
+        test.assertTrue(np.array_equal(off_output, on_output))
+        test.assertEqual(len(observed), 1)
+        states = observed[0]
+        test.assertEqual(states.shape, (3, before.shape[0], 3))
+        deltas = np.asarray(states[1:] - states[:-1], dtype=np.float64)
+        for delta in deltas:
+            norms = np.linalg.norm(delta, axis=1)
+            argmax = int(np.argmax(norms))
+            test.assertEqual(argmax, int(np.flatnonzero(norms == norms[argmax])[0]))
+            test.assertTrue(np.isfinite(norms).all())
+            test.assertAlmostEqual(float(np.max(norms)), float(norms[argmax]), places=12)
+        expected_rms = float(np.sqrt(np.mean(np.sum(delta * delta, axis=1))))
+        test.assertAlmostEqual(float(np.sqrt(np.mean(np.sum(delta * delta, axis=1)))), expected_rms, places=12)
+        test.assertEqual(events["pass_count"], events["particle_color_group_count"] * 3)
+        test.assertEqual(events["event_capacity"], 8 * events["tet_count"])
+        for one_pass in events["passes"]:
+            counts = one_pass["reason_counts"]
+            records = one_pass["records"]
+            test.assertEqual(sum(counts), len(records))
+            test.assertEqual(records, sorted(records))
+        # Corrupting a fixed counter proves readback refuses truncation.
+        counts = solver._particle_active_set_cycle_event_counts
+        counts.assign(np.full(counts.shape, events["event_capacity"] + 1, dtype=np.int32))
+        with test.assertRaises(OverflowError):
+            solver.read_particle_active_set_cycle_events()
+
+
 class TestSolverVBD(unittest.TestCase):
     pass
 
@@ -4856,6 +4930,13 @@ add_function_test(
     TestSolverVBD,
     "test_vbd_particle_sweep_telemetry",
     _test_vbd_particle_sweep_telemetry,
+    devices=devices,
+)
+
+add_function_test(
+    TestSolverVBD,
+    "test_vbd_particle_active_set_cycle_telemetry",
+    _test_vbd_particle_active_set_cycle_telemetry,
     devices=devices,
 )
 
