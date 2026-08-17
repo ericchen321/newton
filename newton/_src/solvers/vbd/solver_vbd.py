@@ -4862,7 +4862,7 @@ class SolverVBD(SolverBase, CouplingInterface):
             self._penetration_free_truncation(state_in.particle_q)
             self._capture_positive_j_guard_actual_post_application(
                 state_in.particle_q,
-                iter_num * len(self.model.particle_color_groups) + color,
+                len(self.model.particle_color_groups) + iter_num * len(self.model.particle_color_groups) + color,
             )
             self._capture_particle_constitutive_objective_audit_pass(
                 state_in,

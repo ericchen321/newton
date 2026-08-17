@@ -4618,6 +4618,135 @@ def _test_vbd_positive_j_solver_paths(test, device):
         test.assertGreater(_round6_tet_determinant(captured), 0.0)
 
 
+def _positive_j_capture_pass_layout(color_count, iterations):
+    """Return the disjoint initializer and solver capture pass ordinals."""
+    initializer = list(range(color_count))
+    solver = [
+        color_count + iteration * color_count + color for iteration in range(iterations) for color in range(color_count)
+    ]
+    return initializer + solver
+
+
+def _positive_j_record_for_particle(payload, site, particle_id):
+    """Select the one committed positive-J record for a site and particle."""
+    records = [
+        record for record in payload["records"] if record["site"] == site and record["particle_id"] == particle_id
+    ]
+    if len(records) != 1:
+        raise AssertionError(f"expected one {site} record for particle {particle_id}, got {len(records)}")
+    return records[0]
+
+
+def _test_vbd_positive_j_initializer_post_application_capture_ordering(test, device):
+    """Keep initializer captures disjoint from later scalar and tile solver passes."""
+    color_count = 7
+    iterations = 3
+    layout = _positive_j_capture_pass_layout(color_count, iterations)
+    test.assertEqual(layout, list(range(color_count + iterations * color_count)))
+    test.assertEqual(len(layout), len(set(layout)))
+    test.assertEqual(layout[6], 6)
+    test.assertEqual(color_count + 0 * color_count + 6, 13)
+    test.assertNotEqual(layout[6], color_count + 0 * color_count + 6)
+
+    def run_initializer(extra_capture_pass=None):
+        model = _round6_solver_model(device)
+        solver = newton.solvers.SolverVBD(
+            model,
+            iterations=1,
+            particle_positive_j_guard_policy="recovery",
+            particle_positive_j_guard_telemetry=True,
+            particle_enable_tile_solve=False,
+            particle_collision_detection_interval=-1,
+        )
+        state = model.state()
+        current = model.particle_q.numpy().copy()
+        current[3, 2] = 5.0e-5
+        state.particle_q.assign(current.astype(np.float32))
+        displacement = np.zeros((model.particle_count, 3), dtype=np.float32)
+        displacement[0, 2] = -1.0e-4
+        solver.particle_displacements.assign(displacement)
+        pre_write = state.particle_q.numpy()[0].copy()
+        solver._reset_positive_j_guard_telemetry()
+        solver._apply_guarded_particle_displacements(state.particle_q)
+        post_write = state.particle_q.numpy()[0].copy()
+        payload = solver.read_positive_j_guard_telemetry_v3()
+        record = _positive_j_record_for_particle(payload, "initializer", 0)
+        test.assertNotEqual(record["actual_post_application_particle_bits"], pre_write.view(np.uint32).tolist())
+        test.assertEqual(record["actual_post_application_particle_bits"], post_write.view(np.uint32).tolist())
+        if extra_capture_pass is not None:
+            changed = state.particle_q.numpy().copy()
+            changed[0, 0] += np.float32(0.125)
+            state.particle_q.assign(changed)
+            solver._capture_positive_j_guard_actual_post_application(state.particle_q, extra_capture_pass)
+            payload = solver.read_positive_j_guard_telemetry_v3()
+            record = _positive_j_record_for_particle(payload, "initializer", 0)
+        return record, post_write
+
+    original, post_write = run_initializer()
+    initializer_pass = original["pass_ordinal"]
+    overwritten, _ = run_initializer(initializer_pass)
+    test.assertEqual(
+        overwritten["actual_post_application_particle_bits"],
+        (post_write + np.asarray((0.125, 0.0, 0.0), dtype=np.float32)).view(np.uint32).tolist(),
+    )
+    preserved, _ = run_initializer(4 + initializer_pass)
+    test.assertEqual(preserved["actual_post_application_particle_bits"], post_write.view(np.uint32).tolist())
+
+    for tile_solve in (False, True) if device.is_cuda else (False,):
+        model = _round6_solver_model(device)
+        solver = newton.solvers.SolverVBD(
+            model,
+            iterations=1,
+            particle_positive_j_guard_policy="recovery",
+            particle_positive_j_guard_telemetry=True,
+            particle_enable_tile_solve=tile_solve,
+            particle_collision_detection_interval=-1,
+        )
+        state_in, state_out = model.state(), model.state()
+        initial = model.particle_q.numpy().copy()
+        initial[3, 2] = 5.0e-5
+        state_in.particle_q.assign(initial.astype(np.float32))
+        state_in.particle_qd.zero_()
+        solver.step(state_in, state_out, model.control(clone_variables=False), None, 0.01)
+        payload = solver.read_positive_j_guard_telemetry_v3()
+        expected_solver_site = "tile" if tile_solve else "scalar"
+        init_record = _positive_j_record_for_particle(payload, "initializer", 0)
+        solve_record = _positive_j_record_for_particle(payload, expected_solver_site, 0)
+        test.assertEqual(init_record["solver_step_epoch"], solve_record["solver_step_epoch"])
+        test.assertEqual(init_record["event_ordinal"], init_record["pass_ordinal"] * model.particle_count)
+        test.assertEqual(solve_record["event_ordinal"], solve_record["pass_ordinal"] * model.particle_count)
+        test.assertLess(init_record["pass_ordinal"], solve_record["pass_ordinal"])
+        for record in (init_record, solve_record):
+            test.assertEqual(record["commit_generation"], record["commit_token"])
+            test.assertEqual(record["actual_post_application_particle_bits"], record["final_applied_particle_bits"])
+
+        def run(enabled, tile_solve=tile_solve):
+            equivalent_model = _round6_solver_model(device)
+            equivalent_solver = newton.solvers.SolverVBD(
+                equivalent_model,
+                iterations=1,
+                particle_positive_j_guard_policy="recovery",
+                particle_positive_j_guard_telemetry=enabled,
+                particle_enable_tile_solve=tile_solve,
+                particle_collision_detection_interval=-1,
+            )
+            equivalent_in, equivalent_out = equivalent_model.state(), equivalent_model.state()
+            equivalent_initial = equivalent_model.particle_q.numpy().copy()
+            equivalent_initial[3, 2] = 5.0e-5
+            equivalent_in.particle_q.assign(equivalent_initial.astype(np.float32))
+            equivalent_in.particle_qd.zero_()
+            equivalent_solver.step(
+                equivalent_in,
+                equivalent_out,
+                equivalent_model.control(clone_variables=False),
+                None,
+                0.01,
+            )
+            return equivalent_out.particle_q.numpy().copy()
+
+        test.assertTrue(np.array_equal(run(False), run(True)))
+
+
 def _round7_predictor_step(device, apex_velocity, gravity, self_contact=False):
     """Run one one-second predictor step for a unit tet with a dynamic apex."""
     builder = newton.ModelBuilder(gravity=gravity)
@@ -5032,6 +5161,13 @@ add_function_test(
     TestSolverVBD,
     "test_vbd_positive_j_solver_paths",
     _test_vbd_positive_j_solver_paths,
+    devices=devices,
+)
+
+add_function_test(
+    TestSolverVBD,
+    "test_vbd_positive_j_initializer_post_application_capture_ordering",
+    _test_vbd_positive_j_initializer_post_application_capture_ordering,
     devices=devices,
 )
 
