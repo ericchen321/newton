@@ -4659,6 +4659,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                         contacts.soft_contact_normal,
                         model.shape_margin,
                         contacts.soft_contact_barycentric,
+                        contacts.soft_contact_area_weight,
                     ],
                     outputs=[
                         self.particle_forces,
@@ -4960,6 +4961,7 @@ class SolverVBD(SolverBase, CouplingInterface):
                         contacts.soft_contact_body_vel,
                         contacts.soft_contact_normal,
                         contacts.soft_contact_barycentric,
+                        contacts.soft_contact_area_weight,
                         model.shape_margin,
                         self.body_particle_contact_buffer_pre_alloc,
                         self.body_particle_contact_counts,

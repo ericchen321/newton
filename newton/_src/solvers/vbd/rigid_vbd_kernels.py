@@ -2171,6 +2171,59 @@ def _eval_soft_ef_contact(
 
 
 @wp.func
+def _eval_soft_ef_contact_weighted(
+    contact_index: int,
+    corners: wp.vec3i,
+    bary: wp.vec3,
+    pos: wp.array[wp.vec3],
+    pos_prev: wp.array[wp.vec3],
+    particle_radius: wp.array[float],
+    contact_ke: float,
+    contact_kd: float,
+    contact_mu: float,
+    friction_epsilon: float,
+    shape_body: wp.array[int],
+    body_q: wp.array[wp.transform],
+    body_q_prev: wp.array[wp.transform],
+    body_qd: wp.array[wp.spatial_vector],
+    body_com: wp.array[wp.vec3],
+    contact_shape: wp.array[int],
+    contact_body_pos: wp.array[wp.vec3],
+    contact_body_vel: wp.array[wp.vec3],
+    contact_normal: wp.array[wp.vec3],
+    shape_margin: wp.array[float],
+    contact_area_weight: wp.array[float],
+    dt: float,
+):
+    """Evaluate the shared soft edge/face law and apply its complete area weight."""
+    force, hessian, bx = _eval_soft_ef_contact(
+        contact_index,
+        corners,
+        bary,
+        pos,
+        pos_prev,
+        particle_radius,
+        contact_ke,
+        contact_kd,
+        contact_mu,
+        friction_epsilon,
+        shape_body,
+        body_q,
+        body_q_prev,
+        body_qd,
+        body_com,
+        contact_shape,
+        contact_body_pos,
+        contact_body_vel,
+        contact_normal,
+        shape_margin,
+        dt,
+    )
+    area_weight = contact_area_weight[contact_index]
+    return force * area_weight, hessian * area_weight, bx
+
+
+@wp.func
 def evaluate_body_particle_contact(
     particle_index: int,
     particle_pos: wp.vec3,
@@ -5383,6 +5436,7 @@ def accumulate_body_particle_contacts_per_body(
     body_particle_contact_normal: wp.array[wp.vec3],
     # Barycentric weights on each record's soft particles; (1, 0, 0) for a particle contact.
     soft_contact_barycentric: wp.array[wp.vec3],
+    soft_contact_area_weight: wp.array[float],
     shape_margin: wp.array[float],
     # Per-body soft-contact adjacency (body-particle)
     body_particle_contact_buffer_pre_alloc: int,
@@ -5486,7 +5540,7 @@ def accumulate_body_particle_contacts_per_body(
             # Edge/face: barycentric contact point over the record's 2-3 soft particles. Uses the
             # shared force law via _eval_soft_ef_contact -- the same evaluation as the particle side.
             bary = soft_contact_barycentric[contact_idx]
-            f_soft, h_soft, cp_world = _eval_soft_ef_contact(
+            f_soft, h_soft, cp_world = _eval_soft_ef_contact_weighted(
                 contact_idx,
                 corners,
                 bary,
@@ -5507,6 +5561,7 @@ def accumulate_body_particle_contacts_per_body(
                 body_particle_contact_body_vel,
                 body_particle_contact_normal,
                 shape_margin,
+                soft_contact_area_weight,
                 dt,
             )
 

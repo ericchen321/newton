@@ -17,7 +17,7 @@ import warp as wp
 from newton._src.math import orthonormal_basis
 from newton._src.solvers.vbd.rigid_vbd_kernels import (
     _eval_body_particle_contact,
-    _eval_soft_ef_contact,
+    _eval_soft_ef_contact_weighted,
     _reset_world_selected,
     evaluate_body_particle_contact,
 )
@@ -3895,6 +3895,7 @@ def accumulate_particle_body_contact_force_and_hessian(
     shape_margin: wp.array[float],
     # Barycentric weights on each record's soft particles; (1, 0, 0) for a particle contact.
     contact_barycentric: wp.array[wp.vec3],
+    contact_area_weight: wp.array[float],
     # outputs: particle force and hessian
     particle_forces: wp.array[wp.vec3],
     particle_hessians: wp.array[wp.mat33],
@@ -3947,7 +3948,7 @@ def accumulate_particle_body_contact_force_and_hessian(
     else:
         # Edge/face contact: barycentric point over the record's 2-3 soft particles.
         bary = contact_barycentric[t_id]
-        ef_force, ef_hessian, _cp_world = _eval_soft_ef_contact(
+        ef_force, ef_hessian, _cp_world = _eval_soft_ef_contact_weighted(
             t_id,
             corners,
             bary,
@@ -3968,6 +3969,7 @@ def accumulate_particle_body_contact_force_and_hessian(
             contact_body_vel,
             contact_normal,
             shape_margin,
+            contact_area_weight,
             dt,
         )
         for i in range(3):

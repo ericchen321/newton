@@ -386,6 +386,17 @@ class Contacts:
             """Contact velocity on body [m/s], shape (soft_contact_max,), dtype :class:`vec3`."""
             self.soft_contact_normal = wp.zeros(soft_contact_max, dtype=wp.vec3, requires_grad=requires_grad)
             """Contact normal direction [unitless], shape (soft_contact_max,), dtype :class:`vec3`."""
+            self.soft_contact_patch_area = wp.zeros(soft_contact_max, dtype=wp.float32)
+            """Current-world clipped contact patch area [m^2], shape (soft_contact_max,), dtype float.
+
+            Ordinary particle and legacy full-surface contacts carry zero area. Area-weighted
+            replacement face contacts carry their clipped current-world patch area.
+            """
+            self.soft_contact_area_weight = wp.ones(soft_contact_max, dtype=wp.float32)
+            """Area weight applied to an area-weighted face contact [unitless], shape (soft_contact_max,), dtype float.
+
+            Ordinary particle and legacy full-surface contacts carry unit weight.
+            """
             # Replay index array for differentiable backward: recorded per launch *thread*, not per
             # contact, so it must span the full particle+edge+face candidate-pair space -- which can
             # exceed soft_contact_max when the caller overrides that capacity. Sized independently so a
@@ -476,6 +487,8 @@ class Contacts:
             self.soft_contact_particle.fill_(-1)
             self.soft_contact_shape.fill_(-1)
             self.soft_contact_tids.fill_(-1)
+            self.soft_contact_patch_area.zero_()
+            self.soft_contact_area_weight.fill_(1.0)
         # else: Optimized path (default) - only counter clear needed
         #   Collision detection overwrites all active contacts [0, contact_count)
         #   Solvers only read [0, contact_count), so stale data is never accessed

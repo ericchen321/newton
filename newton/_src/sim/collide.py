@@ -39,6 +39,17 @@ from ..sim.model import Model
 from ..sim.state import State
 
 
+@wp.kernel(enable_backward=False)
+def _reset_soft_contact_area_metadata(
+    patch_area: wp.array[float],
+    area_weight: wp.array[float],
+):
+    """Reset per-row area metadata before the unified soft-contact passes write records."""
+    index = wp.tid()
+    patch_area[index] = 0.0
+    area_weight[index] = 1.0
+
+
 def _shape_collide_mask(model: Model, shape_count: int | None = None) -> np.ndarray:
     """Return a host mask for shapes participating in shape-shape collision."""
     shape_flags = getattr(model, "shape_flags", None)
@@ -702,6 +713,22 @@ def _build_soft_particle_rigid_contact_pairs(model: Model) -> wp.array[wp.vec2i]
     return _world_compatible_pairs(model.particle_world.numpy(), model.shape_world.numpy(), world_count, model.device)
 
 
+def _filter_soft_feature_rigid_contact_pairs(
+    pairs: wp.array[wp.vec2i],
+    selected_features: tuple[int, ...],
+    selected_shapes: tuple[int, ...],
+    device,
+) -> wp.array[wp.vec2i]:
+    """Remove one selected soft-feature/shape cross-product from host-built pairs."""
+    pair_array = pairs.numpy().reshape(-1, 2)
+    if pair_array.size == 0 or not selected_features or not selected_shapes:
+        return pairs
+    remove = np.isin(pair_array[:, 0], np.asarray(selected_features, dtype=np.int64)) & np.isin(
+        pair_array[:, 1], np.asarray(selected_shapes, dtype=np.int64)
+    )
+    return wp.array(pair_array[~remove].astype(np.int32, copy=False), dtype=wp.vec2i, device=device)
+
+
 def _count_soft_particle_rigid_contact_pairs(model: Model) -> int:
     """Count exactly how many pairs :func:`_build_soft_particle_rigid_contact_pairs` emits for ``model``.
 
@@ -908,6 +935,33 @@ class CollisionPipeline:
             if not np.isfinite(value) or value < 0.0:
                 raise ValueError(f"max_speculative_extension must be a non-negative finite number, got {value!r}")
 
+    @dataclasses.dataclass(frozen=True)
+    class RigidSoftSurfaceReplacement:
+        """Select canonical soft features for pair-scoped area-weighted face replacement."""
+
+        particle_indices: tuple[int, ...] | np.ndarray
+        edge_indices: tuple[int, ...] | np.ndarray
+        face_indices: tuple[int, ...] | np.ndarray
+        shape_indices: tuple[int, ...] | np.ndarray
+        full_surface: bool = False
+
+        def __post_init__(self) -> None:
+            for name in ("particle_indices", "edge_indices", "face_indices", "shape_indices"):
+                values = np.asarray(getattr(self, name))
+                if values.ndim != 1 or (values.size and values.dtype.kind not in "iu"):
+                    raise ValueError(f"{name} must be a one-dimensional integer selector")
+                if not values.size:
+                    values = values.astype(np.int64)
+                if values.size != np.unique(values).size:
+                    raise ValueError(f"{name} must contain unique indices")
+                object.__setattr__(self, name, tuple(int(value) for value in values.tolist()))
+            if not self.face_indices:
+                raise ValueError("face_indices must be nonempty")
+            if not self.shape_indices:
+                raise ValueError("shape_indices must be nonempty")
+            if type(self.full_surface) is not bool or not self.full_surface:
+                raise ValueError("RigidSoftSurfaceReplacement requires full_surface=True")
+
     def __init__(
         self,
         model: Model,
@@ -920,6 +974,7 @@ class CollisionPipeline:
         soft_contact_max: int | None = None,
         soft_contact_margin: float = 0.01,
         enable_rigid_soft_full_surface_contact: bool = False,
+        rigid_soft_surface_replacement: CollisionPipeline.RigidSoftSurfaceReplacement | None = None,
         requires_grad: bool | None = None,
         broad_phase: Literal["nxn", "sap", "explicit"]
         | BroadPhaseAllPairs
@@ -974,6 +1029,11 @@ class CollisionPipeline:
                 :class:`~newton.solvers.SolverVBD`; other solvers raise on such contacts. Records are
                 emitted into :attr:`Contacts.soft_contact_indices`. Defaults to False. Fixed at
                 construction because it sizes the soft-contact buffer headroom.
+            rigid_soft_surface_replacement: Pair-scoped replacement of selected particle and edge
+                candidates with canonical exterior-face contacts whose force and Hessian are scaled by
+                their clipped current-world patch area. Requires
+                ``enable_rigid_soft_full_surface_contact=True`` and a nonempty face and shape selector.
+                ``None`` retains the legacy candidate and output behaviour.
             requires_grad: Whether pipeline-generated soft contacts and the
                 deprecated automatic rigid-contact outputs require gradients.
                 If None, uses ``model.requires_grad``. Explicit calls to
@@ -1118,6 +1178,11 @@ class CollisionPipeline:
         self.soft_contact_margin = soft_contact_margin
         self.include_static_kinematic_pairs = include_static_kinematic_pairs
         self.speculative_config = speculative_config
+        if rigid_soft_surface_replacement is not None and not enable_rigid_soft_full_surface_contact:
+            raise ValueError(
+                "rigid_soft_surface_replacement requires enable_rigid_soft_full_surface_contact=True"
+            )
+        self.rigid_soft_surface_replacement = rigid_soft_surface_replacement
         self._speculative_enabled = speculative_config is not None
         contact_writer = write_contact_speculative if self._speculative_enabled else write_contact
 
@@ -1364,7 +1429,42 @@ class CollisionPipeline:
 
         # Built here (not in finalize) so models/tasks that never collide don't pay for it.
         # Host-side, so not graph-capture-safe -- construct the pipeline before any capture.
+        replacement = rigid_soft_surface_replacement
+        if replacement is not None:
+            selector_ranges = {
+                "particle_indices": int(getattr(model, "particle_count", 0) or 0),
+                "edge_indices": int(getattr(model, "edge_count", 0) or 0),
+                "face_indices": int(getattr(model, "tri_count", 0) or 0),
+                "shape_indices": int(getattr(model, "shape_count", 0) or 0),
+            }
+            for name, limit in selector_ranges.items():
+                values = getattr(replacement, name)
+                if any(value < 0 or value >= limit for value in values):
+                    raise ValueError(f"{name} contains an index outside model range [0, {limit})")
+            tri_areas = getattr(model, "tri_areas", None)
+            if tri_areas is None:
+                raise ValueError("rigid_soft_surface_replacement requires public model.tri_areas")
+            rest_areas = np.asarray(tri_areas.numpy(), dtype=np.float64).reshape(-1)
+            selected_rest_areas = rest_areas[np.asarray(replacement.face_indices, dtype=np.intp)]
+            if (
+                selected_rest_areas.size == 0
+                or not np.isfinite(selected_rest_areas).all()
+                or np.any(selected_rest_areas <= 0.0)
+            ):
+                raise ValueError("rigid_soft_surface_replacement selected rest areas must be finite and positive")
+            self.soft_surface_replacement_rest_area_mean = float(np.mean(selected_rest_areas))
+            if not np.isfinite(self.soft_surface_replacement_rest_area_mean) or self.soft_surface_replacement_rest_area_mean <= 0.0:
+                raise ValueError("rigid_soft_surface_replacement rest-area mean must be finite and positive")
+        else:
+            self.soft_surface_replacement_rest_area_mean = 1.0
         self.soft_rigid_contact_pairs = _build_soft_particle_rigid_contact_pairs(model)
+        if replacement is not None:
+            self.soft_rigid_contact_pairs = _filter_soft_feature_rigid_contact_pairs(
+                self.soft_rigid_contact_pairs,
+                replacement.particle_indices,
+                replacement.shape_indices,
+                model.device,
+            )
         self._soft_rigid_contact_pair_count = len(self.soft_rigid_contact_pairs)
         self.enable_rigid_soft_full_surface_contact = enable_rigid_soft_full_surface_contact
         # Full-surface edge/face candidate pairs (world-compatible, like the particle pairs above);
@@ -1382,9 +1482,57 @@ class CollisionPipeline:
                 _warn_full_surface_fallbacks(model, _capable)
             self.soft_edge_rigid_pairs = _build_soft_edge_rigid_contact_pairs(model, _capable)
             self.soft_face_rigid_pairs = _build_soft_face_rigid_contact_pairs(model, _capable)
+            self._soft_face_rigid_legacy_pairs = self.soft_face_rigid_pairs
+            self._soft_face_rigid_replacement_pairs = wp.array(
+                np.empty((0, 2), dtype=np.int32), dtype=wp.vec2i, device=model.device
+            )
+            if replacement is not None:
+                selected_shape_ids = np.asarray(replacement.shape_indices, dtype=np.intp)
+                selected_particle_shapes = (
+                    model.shape_flags.numpy()[selected_shape_ids] & int(ShapeFlags.COLLIDE_PARTICLES)
+                ) != 0
+                if _capable is None or not bool(np.all(_capable[selected_shape_ids][selected_particle_shapes])):
+                    raise ValueError(
+                        "rigid_soft_surface_replacement selected a shape without the canonical face SDF path"
+                    )
+                self.soft_edge_rigid_pairs = _filter_soft_feature_rigid_contact_pairs(
+                    self.soft_edge_rigid_pairs,
+                    replacement.edge_indices,
+                    replacement.shape_indices,
+                    model.device,
+                )
+                selected_face_ids = np.asarray(replacement.face_indices, dtype=np.intp)
+                selected_faces = _world_compatible_pairs(
+                    model.particle_world.numpy()[model.tri_indices.numpy()[selected_face_ids, 0]],
+                    model.shape_world.numpy()[selected_shape_ids],
+                    int(getattr(model, "world_count", 0) or 0),
+                    model.device,
+                    shape_ok=_capable[selected_shape_ids],
+                )
+                selected_faces_host = selected_faces.numpy().reshape(-1, 2)
+                if selected_faces_host.size:
+                    selected_faces_host[:, 0] = np.asarray(replacement.face_indices, dtype=np.int32)[selected_faces_host[:, 0]]
+                    selected_faces_host[:, 1] = np.asarray(replacement.shape_indices, dtype=np.int32)[selected_faces_host[:, 1]]
+                self._soft_face_rigid_replacement_pairs = wp.array(
+                    selected_faces_host.astype(np.int32, copy=False), dtype=wp.vec2i, device=model.device
+                )
+                self._soft_face_rigid_legacy_pairs = _filter_soft_feature_rigid_contact_pairs(
+                    self.soft_face_rigid_pairs,
+                    replacement.face_indices,
+                    replacement.shape_indices,
+                    model.device,
+                )
+                legacy_host = self._soft_face_rigid_legacy_pairs.numpy().reshape(-1, 2)
+                selected_host = self._soft_face_rigid_replacement_pairs.numpy().reshape(-1, 2)
+                combined = np.concatenate((legacy_host, selected_host), axis=0) if selected_host.size else legacy_host
+                self.soft_face_rigid_pairs = wp.array(
+                    combined.astype(np.int32, copy=False), dtype=wp.vec2i, device=model.device
+                )
         else:
             _empty_pairs = wp.array(np.empty((0, 2), np.int32), dtype=wp.vec2i, device=model.device)
             self.soft_edge_rigid_pairs, self.soft_face_rigid_pairs = _empty_pairs, _empty_pairs
+            self._soft_face_rigid_legacy_pairs = _empty_pairs
+            self._soft_face_rigid_replacement_pairs = _empty_pairs
         if soft_contact_max is None:
             soft_contact_max = self.soft_rigid_contact_pair_count
             # Flag-aware headroom: one record per world-compatible (soft edge/tri, shape) pair.
@@ -1628,6 +1776,14 @@ class CollisionPipeline:
             device=self.device,
             record_tape=False,
         )
+        if contacts.soft_contact_max > 0:
+            wp.launch(
+                kernel=_reset_soft_contact_area_metadata,
+                dim=contacts.soft_contact_max,
+                inputs=[contacts.soft_contact_patch_area, contacts.soft_contact_area_weight],
+                device=self.device,
+                record_tape=False,
+            )
 
         if speculative_active:
             wp.launch(
@@ -1954,8 +2110,10 @@ class CollisionPipeline:
                 margin=soft_contact_margin,
                 device=self.device,
                 edge_pairs=self.soft_edge_rigid_pairs,
-                face_pairs=self.soft_face_rigid_pairs,
+                face_pairs=self._soft_face_rigid_legacy_pairs,
                 n_particle_pairs=self.soft_rigid_contact_pair_count,
+                face_replacement_pairs=self._soft_face_rigid_replacement_pairs,
+                face_rest_area_mean=self.soft_surface_replacement_rest_area_mean,
             )
 
         # Preserve the previous provenance if validation or collision setup fails.

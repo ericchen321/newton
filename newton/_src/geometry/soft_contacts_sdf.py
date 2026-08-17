@@ -239,6 +239,117 @@ def _shape_frames(
 
 
 @wp.func
+def _clip_edge_to_contact_halfspace(
+    point_inside: wp.vec3,
+    bary_inside: wp.vec3,
+    psi_inside: float,
+    point_outside: wp.vec3,
+    bary_outside: wp.vec3,
+    psi_outside: float,
+):
+    """Intersect an inside-to-outside edge with the strict ``psi < 0`` half-space."""
+    t = psi_inside / (psi_inside - psi_outside)
+    return (
+        point_inside + t * (point_outside - point_inside),
+        bary_inside + t * (bary_outside - bary_inside),
+    )
+
+
+@wp.func
+def _triangle_area_and_centroid(
+    p0: wp.vec3,
+    p1: wp.vec3,
+    p2: wp.vec3,
+    b0: wp.vec3,
+    b1: wp.vec3,
+    b2: wp.vec3,
+):
+    area = 0.5 * wp.length(wp.cross(p1 - p0, p2 - p0))
+    return area, (b0 + b1 + b2) / 3.0
+
+
+@wp.func
+def _clipped_triangle_area_and_barycentric_centroid(
+    p0: wp.vec3,
+    p1: wp.vec3,
+    p2: wp.vec3,
+    b0: wp.vec3,
+    b1: wp.vec3,
+    b2: wp.vec3,
+    psi0: float,
+    psi1: float,
+    psi2: float,
+):
+    """Clip one fan triangle and return area plus its original-face barycentric centroid."""
+    inside0 = psi0 < 0.0
+    inside1 = psi1 < 0.0
+    inside2 = psi2 < 0.0
+    inside_count = int(inside0) + int(inside1) + int(inside2)
+    if inside_count == 0:
+        return 0.0, wp.vec3(0.0)
+
+    if inside_count == 3:
+        return _triangle_area_and_centroid(p0, p1, p2, b0, b1, b2)
+
+    area = 0.0
+    bary_sum = wp.vec3(0.0)
+    if inside_count == 1:
+        if inside0:
+            i01, bi01 = _clip_edge_to_contact_halfspace(p0, b0, psi0, p1, b1, psi1)
+            i20, bi20 = _clip_edge_to_contact_halfspace(p0, b0, psi0, p2, b2, psi2)
+            area, centroid = _triangle_area_and_centroid(p0, i01, i20, b0, bi01, bi20)
+        elif inside1:
+            i12, bi12 = _clip_edge_to_contact_halfspace(p1, b1, psi1, p2, b2, psi2)
+            i01, bi01 = _clip_edge_to_contact_halfspace(p1, b1, psi1, p0, b0, psi0)
+            area, centroid = _triangle_area_and_centroid(p1, i12, i01, b1, bi12, bi01)
+        else:
+            i20, bi20 = _clip_edge_to_contact_halfspace(p2, b2, psi2, p0, b0, psi0)
+            i12, bi12 = _clip_edge_to_contact_halfspace(p2, b2, psi2, p1, b1, psi1)
+            area, centroid = _triangle_area_and_centroid(p2, i20, i12, b2, bi20, bi12)
+        return area, centroid
+
+    if not inside0:
+        i01, bi01 = _clip_edge_to_contact_halfspace(p1, b1, psi1, p0, b0, psi0)
+        i20, bi20 = _clip_edge_to_contact_halfspace(p2, b2, psi2, p0, b0, psi0)
+        area0, centroid0 = _triangle_area_and_centroid(i01, p1, p2, bi01, b1, b2)
+        area1, centroid1 = _triangle_area_and_centroid(i01, p2, i20, bi01, b2, bi20)
+    elif not inside1:
+        i12, bi12 = _clip_edge_to_contact_halfspace(p2, b2, psi2, p1, b1, psi1)
+        i01, bi01 = _clip_edge_to_contact_halfspace(p0, b0, psi0, p1, b1, psi1)
+        area0, centroid0 = _triangle_area_and_centroid(i12, p2, p0, bi12, b2, b0)
+        area1, centroid1 = _triangle_area_and_centroid(i12, p0, i01, bi12, b0, bi01)
+    else:
+        i12, bi12 = _clip_edge_to_contact_halfspace(p0, b0, psi0, p2, b2, psi2)
+        i20, bi20 = _clip_edge_to_contact_halfspace(p1, b1, psi1, p2, b2, psi2)
+        area0, centroid0 = _triangle_area_and_centroid(p0, p1, i20, b0, b1, bi20)
+        area1, centroid1 = _triangle_area_and_centroid(p0, i20, i12, b0, bi20, bi12)
+    area = area0 + area1
+    if area > 0.0:
+        bary_sum = (area0 * centroid0 + area1 * centroid1) / area
+    return area, bary_sum
+
+
+@wp.func
+def _face_gap(
+    geo: wp.int32,
+    scale: wp.vec3,
+    point_world: wp.vec3,
+    X_sw: wp.transform,
+    shape_sdf_index: wp.int32,
+    texture_sdf_table: wp.array[TextureSDFData],
+    threshold: float,
+):
+    _phi_lower, phi, _grad = eval_shape_sdf(
+        geo,
+        scale,
+        wp.transform_point(X_sw, point_world),
+        shape_sdf_index,
+        texture_sdf_table,
+    )
+    return phi - threshold
+
+
+@wp.func
 def _emit_soft_ef_contact(
     tid: wp.int32,
     tid_base: wp.int32,
@@ -252,12 +363,16 @@ def _emit_soft_ef_contact(
     soft_contact_body_pos: wp.array[wp.vec3],
     soft_contact_body_vel: wp.array[wp.vec3],
     soft_contact_normal: wp.array[wp.vec3],
+    soft_contact_patch_area: wp.array[float],
+    soft_contact_area_weight: wp.array[float],
     corners: wp.vec3i,
     bary: wp.vec3,
     shape_index: wp.int32,
     body_pos: wp.vec3,
     body_vel: wp.vec3,
     normal: wp.vec3,
+    patch_area: float,
+    area_weight: float,
 ):
     """Append one edge/face record into the single unified soft-contact stream.
 
@@ -279,6 +394,8 @@ def _emit_soft_ef_contact(
         soft_contact_body_pos[idx] = body_pos
         soft_contact_body_vel[idx] = body_vel
         soft_contact_normal[idx] = normal
+        soft_contact_patch_area[idx] = patch_area
+        soft_contact_area_weight[idx] = area_weight
 
 
 @wp.kernel
@@ -299,6 +416,8 @@ def create_soft_face_contacts(
     sdf_face_iters: wp.int32,
     sdf_ls_iters: wp.int32,
     margin: float,
+    area_weighted: wp.int32,
+    face_rest_area_mean: float,
     tid_base: wp.int32,
     soft_contact_max: wp.int32,
     soft_contact_count: wp.array[wp.int32],
@@ -310,6 +429,8 @@ def create_soft_face_contacts(
     soft_contact_body_pos: wp.array[wp.vec3],
     soft_contact_body_vel: wp.array[wp.vec3],
     soft_contact_normal: wp.array[wp.vec3],
+    soft_contact_patch_area: wp.array[float],
+    soft_contact_area_weight: wp.array[float],
 ):
     """One thread per world-compatible (soft triangle, shape) pair. Minimizes the rigid SDF over the
     triangle interior and emits a unified ``(v0, v1, v2)`` face record if within margin. Pairs are
@@ -343,6 +464,9 @@ def create_soft_face_contacts(
     # Per-shape contact margin (#2994), same threshold term as the legacy particle pass.
     s_margin = shape_margin[shape_index] if shape_margin.shape[0] > 0 else 0.0
     threshold = margin + s_margin + radius
+    # The query margin only broadens candidate emission.  The area patch is the physical
+    # penetration shell prescribed by H9, so its gap excludes that speculative margin.
+    patch_threshold = s_margin + radius
 
     centroid_s = (a_s + b_s + c_s) / 3.0
     phi_c, _phi_c_a, _grad_c = eval_shape_sdf(geo, scale, centroid_s, sdf_idx, texture_sdf_table)
@@ -358,6 +482,85 @@ def create_soft_face_contacts(
     )
     if phi < threshold:
         y = x - phi * grad
+        contact_bary = bary
+        patch_area = 0.0
+        area_weight = 1.0
+        contact_body_pos = wp.transform_point(X_bs, y)
+        contact_normal = wp.transform_vector(X_ws, grad)
+        if area_weighted != 0:
+            e0 = wp.vec3(1.0, 0.0, 0.0)
+            e1 = wp.vec3(0.0, 1.0, 0.0)
+            e2 = wp.vec3(0.0, 0.0, 1.0)
+            a_w = particle_q[a_idx]
+            b_w = particle_q[b_idx]
+            c_w = particle_q[c_idx]
+            b_m = bary
+            fan_p0 = b_m[0] * a_w + b_m[1] * b_w + b_m[2] * c_w
+            fan_p1 = a_w
+            fan_p2 = b_w
+            psi0 = _face_gap(geo, scale, fan_p0, X_sw, sdf_idx, texture_sdf_table, patch_threshold)
+            psi1 = _face_gap(geo, scale, fan_p1, X_sw, sdf_idx, texture_sdf_table, patch_threshold)
+            psi2 = _face_gap(geo, scale, fan_p2, X_sw, sdf_idx, texture_sdf_table, patch_threshold)
+            patch_area, contact_bary = _clipped_triangle_area_and_barycentric_centroid(
+                fan_p0, fan_p1, fan_p2, b_m, e0, e1, psi0, psi1, psi2
+            )
+            fan_p0 = b_m[0] * a_w + b_m[1] * b_w + b_m[2] * c_w
+            fan_p1 = b_w
+            fan_p2 = c_w
+            psi0 = _face_gap(geo, scale, fan_p0, X_sw, sdf_idx, texture_sdf_table, patch_threshold)
+            psi1 = _face_gap(geo, scale, fan_p1, X_sw, sdf_idx, texture_sdf_table, patch_threshold)
+            psi2 = _face_gap(geo, scale, fan_p2, X_sw, sdf_idx, texture_sdf_table, patch_threshold)
+            patch_area_1, centroid_1 = _clipped_triangle_area_and_barycentric_centroid(
+                fan_p0, fan_p1, fan_p2, b_m, e1, e2, psi0, psi1, psi2
+            )
+            patch_area += patch_area_1
+            if patch_area > 0.0:
+                contact_bary = (patch_area - patch_area_1) / patch_area * contact_bary + patch_area_1 / patch_area * centroid_1
+            fan_p0 = b_m[0] * a_w + b_m[1] * b_w + b_m[2] * c_w
+            fan_p1 = c_w
+            fan_p2 = a_w
+            psi0 = _face_gap(geo, scale, fan_p0, X_sw, sdf_idx, texture_sdf_table, patch_threshold)
+            psi1 = _face_gap(geo, scale, fan_p1, X_sw, sdf_idx, texture_sdf_table, patch_threshold)
+            psi2 = _face_gap(geo, scale, fan_p2, X_sw, sdf_idx, texture_sdf_table, patch_threshold)
+            patch_area_2, centroid_2 = _clipped_triangle_area_and_barycentric_centroid(
+                fan_p0, fan_p1, fan_p2, b_m, e2, e0, psi0, psi1, psi2
+            )
+            old_area = patch_area
+            patch_area += patch_area_2
+            if patch_area > 0.0:
+                contact_bary = old_area / patch_area * contact_bary + patch_area_2 / patch_area * centroid_2
+            if (
+                not wp.isfinite(patch_area)
+                or patch_area <= 0.0
+                or not wp.isfinite(face_rest_area_mean)
+                or face_rest_area_mean <= 0.0
+            ):
+                return
+            bary_norm = contact_bary[0] + contact_bary[1] + contact_bary[2]
+            if not wp.isfinite(bary_norm) or bary_norm <= 0.0:
+                return
+            contact_bary = contact_bary / bary_norm
+            area_weight = patch_area / face_rest_area_mean
+            if not wp.isfinite(area_weight) or area_weight <= 0.0:
+                return
+            # The minimizer only identifies/culls the face and anchors the fan.  The
+            # representative contact is evaluated once at the clipped current-world
+            # patch centroid, then projected with that SDF sample.
+            patch_centroid_world = contact_bary[0] * a_w + contact_bary[1] * b_w + contact_bary[2] * c_w
+            patch_centroid_shape = wp.transform_point(X_sw, patch_centroid_world)
+            _patch_phi_lower, patch_phi, patch_grad = eval_shape_sdf(
+                geo,
+                scale,
+                patch_centroid_shape,
+                sdf_idx,
+                texture_sdf_table,
+            )
+            patch_grad_length = wp.length(patch_grad)
+            if not wp.isfinite(patch_phi) or not wp.isfinite(patch_grad_length) or patch_grad_length <= 0.0:
+                return
+            patch_surface_shape = patch_centroid_shape - patch_phi * patch_grad
+            contact_body_pos = wp.transform_point(X_bs, patch_surface_shape)
+            contact_normal = wp.transform_vector(X_ws, patch_grad)
         _emit_soft_ef_contact(
             tid,
             tid_base,
@@ -371,12 +574,16 @@ def create_soft_face_contacts(
             soft_contact_body_pos,
             soft_contact_body_vel,
             soft_contact_normal,
+            soft_contact_patch_area,
+            soft_contact_area_weight,
             wp.vec3i(a_idx, b_idx, c_idx),
-            bary,
+            contact_bary,
             shape_index,
-            wp.transform_point(X_bs, y),
+            contact_body_pos,
             wp.vec3(0.0, 0.0, 0.0),
-            wp.transform_vector(X_ws, grad),
+            contact_normal,
+            patch_area,
+            area_weight,
         )
 
 
@@ -408,6 +615,8 @@ def create_soft_edge_contacts(
     soft_contact_body_pos: wp.array[wp.vec3],
     soft_contact_body_vel: wp.array[wp.vec3],
     soft_contact_normal: wp.array[wp.vec3],
+    soft_contact_patch_area: wp.array[float],
+    soft_contact_area_weight: wp.array[float],
 ):
     """One thread per world-compatible (unique soft edge, shape) pair. Minimizes the rigid SDF along
     the edge and emits a unified ``(v0, v1, -1)`` edge record if within margin. The endpoints come
@@ -462,16 +671,32 @@ def create_soft_edge_contacts(
             soft_contact_body_pos,
             soft_contact_body_vel,
             soft_contact_normal,
+            soft_contact_patch_area,
+            soft_contact_area_weight,
             wp.vec3i(v0, v1, -1),
             wp.vec3(1.0 - u, u, 0.0),
             shape_index,
             wp.transform_point(X_bs, y),
             wp.vec3(0.0, 0.0, 0.0),
             wp.transform_vector(X_ws, grad),
+            0.0,
+            1.0,
         )
 
 
-def launch_soft_ef_contacts(*, model, state, contacts, margin: float, device, edge_pairs, face_pairs, n_particle_pairs):
+def launch_soft_ef_contacts(
+    *,
+    model,
+    state,
+    contacts,
+    margin: float,
+    device,
+    edge_pairs,
+    face_pairs,
+    n_particle_pairs,
+    face_replacement_pairs=None,
+    face_rest_area_mean: float = 1.0,
+):
     """Launch the soft EDGE and FACE passes (the soft-particle pass is the legacy kernel).
 
     ``edge_pairs`` / ``face_pairs`` are precomputed world-compatible (soft feature, shape) index
@@ -487,7 +712,8 @@ def launch_soft_ef_contacts(*, model, state, contacts, margin: float, device, ed
     # flag-off cases, since the pairs are built from the mesh edges and shapes.
     n_edge_pairs = int(edge_pairs.shape[0])
     n_face_pairs = int(face_pairs.shape[0])
-    if n_edge_pairs == 0 and n_face_pairs == 0:
+    n_replacement_pairs = int(face_replacement_pairs.shape[0]) if face_replacement_pairs is not None else 0
+    if n_edge_pairs == 0 and n_face_pairs == 0 and n_replacement_pairs == 0:
         return
 
     shape_args = [
@@ -511,6 +737,8 @@ def launch_soft_ef_contacts(*, model, state, contacts, margin: float, device, ed
         contacts.soft_contact_body_pos,
         contacts.soft_contact_body_vel,
         contacts.soft_contact_normal,
+        contacts.soft_contact_patch_area,
+        contacts.soft_contact_area_weight,
     ]
 
     if n_edge_pairs > 0:
@@ -544,7 +772,30 @@ def launch_soft_ef_contacts(*, model, state, contacts, margin: float, device, ed
                 SDF_FACE_ITERS,
                 SDF_LS_ITERS,
                 margin,
+                0,
+                1.0,
                 n_particle_pairs + n_edge_pairs,
+                contacts.soft_contact_max,
+            ],
+            outputs=outputs,
+            device=device,
+        )
+    if n_replacement_pairs > 0:
+        wp.launch(
+            create_soft_face_contacts,
+            dim=n_replacement_pairs,
+            inputs=[
+                face_replacement_pairs,
+                state.particle_q,
+                model.particle_radius,
+                model.tri_indices,
+                *shape_args,
+                SDF_FACE_ITERS,
+                SDF_LS_ITERS,
+                margin,
+                1,
+                face_rest_area_mean,
+                n_particle_pairs + n_edge_pairs + n_face_pairs,
                 contacts.soft_contact_max,
             ],
             outputs=outputs,

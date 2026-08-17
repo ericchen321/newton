@@ -30,6 +30,7 @@ from newton._src.solvers.vbd.rigid_vbd_kernels import (
     _joint_angular_rho_seed,
     build_body_body_contact_lists,
     build_body_particle_contact_lists,
+    accumulate_body_particle_contacts_per_body,
     compute_rigid_contact_forces,
     evaluate_angular_constraint_force_hessian,
     evaluate_body_particle_contact,
@@ -1838,6 +1839,7 @@ def _body_particle_contact_damping_ignores_penalty_ramp(test, device):
                 contact_normal,
                 wp.zeros(0, dtype=float, device=device),
                 wp.zeros(4, dtype=wp.vec3, device=device),  # barycentric (unused on the particle path)
+                wp.ones(4, dtype=float, device=device),  # ordinary contacts carry unit area weight
             ],
             outputs=[forces, hessians],
             device=device,
@@ -5760,7 +5762,7 @@ def _set_slot(arr, idx, value):
     arr.assign(a)
 
 
-def _run_face_section2(device, shape_margin):
+def _run_face_section2(device, shape_margin, area_weight=1.0):
     """Build a single soft-FACE contact, seed the shared AVBD per-contact material via
     ``init_body_particle_contacts``, then launch the particle-side kernel once with the given
     ``shape_margin`` array. The geometry gives a 0.05 penetration along +z; returns
@@ -5790,6 +5792,7 @@ def _run_face_section2(device, shape_margin):
     _set_slot(contacts.soft_contact_body_pos, 0, [0.3, 0.1, 0.05])
     _set_slot(contacts.soft_contact_body_vel, 0, [0.0, 0.0, 0.0])
     _set_slot(contacts.soft_contact_normal, 0, [0.0, 0.0, 1.0])
+    _set_slot(contacts.soft_contact_area_weight, 0, area_weight)
     model.particle_colors.assign([0, 0, 0])
 
     # Dummy single-entry body arrays (the record's shape is on the world, body = -1, so these
@@ -5855,6 +5858,7 @@ def _run_face_section2(device, shape_margin):
             contacts.soft_contact_normal,
             shape_margin,
             contacts.soft_contact_barycentric,
+            contacts.soft_contact_area_weight,
         ],
         outputs=[forces, hessians],
         device=device,
@@ -5881,6 +5885,101 @@ def test_barycentric_force_distribution(test, device):
         np.testing.assert_allclose(h[vi][2, 2], bary[i] ** 2 * ke, rtol=2e-4, atol=1e-4)
     # The distributed force sums back to the single-point force (sum of bary == 1).
     np.testing.assert_allclose(f[p0] + f[p1] + f[p2], single_force, rtol=2e-4, atol=1e-4)
+
+
+def test_area_weight_scales_particle_force_and_hessian(test, device):
+    """The complete face force/Hessian scales once before barycentric scatter."""
+    f1, h1, _ke, _bary, verts = _run_face_section2(device, wp.zeros(0, dtype=float, device=device), 1.0)
+    f2, h2, _ke, _bary, _ = _run_face_section2(device, wp.zeros(0, dtype=float, device=device), 2.0)
+    verts = list(verts)
+    np.testing.assert_allclose(f2[verts], 2.0 * f1[verts], rtol=2e-4, atol=1e-4)
+    np.testing.assert_allclose(h2[verts], 2.0 * h1[verts], rtol=2e-4, atol=1e-4)
+
+
+def _run_rigid_face_section2(device, area_weight):
+    """Run the rigid-side per-body accumulation for one manually seeded face row."""
+    builder = newton.ModelBuilder()
+    body = builder.add_body(xform=wp.transform(wp.vec3(0.0, 0.0, 0.2), wp.quat_identity()))
+    builder.add_shape_box(body=body, hx=1.0, hy=1.0, hz=1.0)
+    p0 = builder.add_particle(wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0), 0.1, radius=0.0)
+    p1 = builder.add_particle(wp.vec3(1.0, 0.0, 0.0), wp.vec3(0.0), 0.1, radius=0.0)
+    p2 = builder.add_particle(wp.vec3(0.0, 1.0, 0.0), wp.vec3(0.0), 0.1, radius=0.0)
+    builder.add_triangle(p0, p1, p2)
+    model = builder.finalize(device=device)
+    state = model.state()
+    contact_indices = wp.array([[p0, p1, p2]], dtype=wp.vec3i, device=device)
+    contact_shape = wp.array([0], dtype=wp.int32, device=device)
+    contact_body_pos = wp.array([[0.3, 0.1, 0.0]], dtype=wp.vec3, device=device)
+    contact_body_vel = wp.zeros(1, dtype=wp.vec3, device=device)
+    contact_normal = wp.array([[0.0, 0.0, 1.0]], dtype=wp.vec3, device=device)
+    bary = wp.array([[0.6, 0.3, 0.1]], dtype=wp.vec3, device=device)
+    weights = wp.array([area_weight], dtype=float, device=device)
+    count = wp.array([1], dtype=wp.int32, device=device)
+    penalty = wp.array([100.0], dtype=float, device=device)
+    material_ke = wp.array([100.0], dtype=float, device=device)
+    material_kd = wp.zeros(1, dtype=float, device=device)
+    material_mu = wp.zeros(1, dtype=float, device=device)
+    color_group = wp.array([body], dtype=wp.int32, device=device)
+    contact_indices_by_body = wp.array([0], dtype=wp.int32, device=device)
+    body_counts = wp.array([1], dtype=wp.int32, device=device)
+    body_forces = wp.zeros(model.body_count, dtype=wp.vec3, device=device)
+    body_torques = wp.zeros(model.body_count, dtype=wp.vec3, device=device)
+    body_h_ll = wp.zeros(model.body_count, dtype=wp.mat33, device=device)
+    body_h_al = wp.zeros(model.body_count, dtype=wp.mat33, device=device)
+    body_h_aa = wp.zeros(model.body_count, dtype=wp.mat33, device=device)
+    wp.launch(
+        accumulate_body_particle_contacts_per_body,
+        dim=4,
+        inputs=[
+            0.01,
+            color_group,
+            state.particle_q,
+            state.particle_q,
+            model.particle_radius,
+            state.body_q,
+            state.body_q,
+            state.body_qd,
+            model.body_com,
+            model.body_inv_mass,
+            model.shape_body,
+            1.0,
+            penalty,
+            material_ke,
+            material_kd,
+            material_mu,
+            count,
+            contact_indices,
+            contact_shape,
+            contact_body_pos,
+            contact_body_vel,
+            contact_normal,
+            bary,
+            weights,
+            wp.zeros(0, dtype=float, device=device),
+            1,
+            body_counts,
+            contact_indices_by_body,
+        ],
+        outputs=[
+            body_forces,
+            body_torques,
+            body_h_ll,
+            body_h_al,
+            body_h_aa,
+        ],
+        device=device,
+    )
+    return body_forces.numpy().copy(), body_h_ll.numpy().copy(), body_h_al.numpy().copy(), body_h_aa.numpy().copy()
+
+
+def test_area_weight_scales_rigid_reaction_and_hessian(test, device):
+    """The rigid reaction and all rigid Hessian blocks use the same complete weight."""
+    f1, hll1, hal1, haa1 = _run_rigid_face_section2(device, 1.0)
+    f2, hll2, hal2, haa2 = _run_rigid_face_section2(device, 2.0)
+    np.testing.assert_allclose(f2, 2.0 * f1, rtol=2e-4, atol=1e-4)
+    np.testing.assert_allclose(hll2, 2.0 * hll1, rtol=2e-4, atol=1e-4)
+    np.testing.assert_allclose(hal2, 2.0 * hal1, rtol=2e-4, atol=1e-4)
+    np.testing.assert_allclose(haa2, 2.0 * haa1, rtol=2e-4, atol=1e-4)
 
 
 def test_edge_face_uses_shape_margin(test, device):
@@ -6008,6 +6107,18 @@ add_function_test(
     TestVBDFullSurfaceContact,
     "test_barycentric_force_distribution",
     test_barycentric_force_distribution,
+    devices=devices,
+)
+add_function_test(
+    TestVBDFullSurfaceContact,
+    "test_area_weight_scales_particle_force_and_hessian",
+    test_area_weight_scales_particle_force_and_hessian,
+    devices=devices,
+)
+add_function_test(
+    TestVBDFullSurfaceContact,
+    "test_area_weight_scales_rigid_reaction_and_hessian",
+    test_area_weight_scales_rigid_reaction_and_hessian,
     devices=devices,
 )
 add_function_test(

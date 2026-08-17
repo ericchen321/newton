@@ -25,6 +25,7 @@ from newton._src.geometry.soft_contacts_sdf import (
     SDF_FACE_ITERS,
     SDF_LS_ITERS,
     _is_analytic,
+    _clipped_triangle_area_and_barycentric_centroid,
     _shape_frames,
     eval_shape_sdf,
     launch_soft_ef_contacts,
@@ -3042,12 +3043,152 @@ class TestFullSurfaceSoftContact(unittest.TestCase):
     pass
 
 
+@wp.kernel
+def _clip_triangle_kernel(
+    p0: wp.vec3,
+    p1: wp.vec3,
+    p2: wp.vec3,
+    b0: wp.vec3,
+    b1: wp.vec3,
+    b2: wp.vec3,
+    psi0: float,
+    psi1: float,
+    psi2: float,
+    out_area: wp.array[float],
+    out_bary: wp.array[wp.vec3],
+):
+    area, bary = _clipped_triangle_area_and_barycentric_centroid(
+        p0, p1, p2, b0, b1, b2, psi0, psi1, psi2
+    )
+    out_area[0] = area
+    out_bary[0] = bary
+
+
+def _build_replacement_triangle_model(device, *, mesh_shape: bool = False):
+    builder = newton.ModelBuilder()
+    if mesh_shape:
+        builder.add_shape_mesh(body=-1, mesh=newton.Mesh.create_box(0.5, 0.5, 0.5))
+    else:
+        builder.add_shape_box(
+            body=-1,
+            xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
+            hx=0.5,
+            hy=0.5,
+            hz=0.5,
+        )
+    p0 = builder.add_particle(wp.vec3(0.0, 0.0, 0.45), wp.vec3(0.0), 1.0, radius=0.01)
+    p1 = builder.add_particle(wp.vec3(0.2, 0.0, 0.45), wp.vec3(0.0), 1.0, radius=0.01)
+    p2 = builder.add_particle(wp.vec3(0.0, 0.2, 0.45), wp.vec3(0.0), 1.0, radius=0.01)
+    builder.add_triangle(p0, p1, p2, tri_ke=1.0, tri_ka=1.0, tri_kd=1.0)
+    return builder.finalize(device=device)
+
+
+def _replacement_selector(model, shape_indices=None):
+    return CollisionPipeline.RigidSoftSurfaceReplacement(
+        particle_indices=np.arange(model.particle_count, dtype=np.int32),
+        edge_indices=np.arange(model.edge_count, dtype=np.int32),
+        face_indices=np.arange(model.tri_count, dtype=np.int32),
+        shape_indices=np.arange(model.shape_count, dtype=np.int32) if shape_indices is None else shape_indices,
+        full_surface=True,
+    )
+
+
+def test_public_surface_replacement_replaces_selected_streams(test, device):
+    """Selected particle/edge pairs disappear and canonical face rows carry area metadata."""
+    model = _build_replacement_triangle_model(device)
+    selector = _replacement_selector(model)
+    pipeline = newton.CollisionPipeline(
+        model,
+        broad_phase="nxn",
+        soft_contact_margin=0.1,
+        enable_rigid_soft_full_surface_contact=True,
+        rigid_soft_surface_replacement=selector,
+    )
+    test.assertEqual(pipeline.soft_rigid_contact_pairs.shape[0], 0)
+    test.assertEqual(pipeline.soft_edge_rigid_pairs.shape[0], 0)
+    test.assertGreater(pipeline.soft_face_rigid_pairs.shape[0], 0)
+    test.assertGreater(pipeline._soft_face_rigid_replacement_pairs.shape[0], 0)
+    test.assertEqual(pipeline._soft_face_rigid_legacy_pairs.shape[0], 0)
+    test.assertAlmostEqual(pipeline.soft_surface_replacement_rest_area_mean, float(model.tri_areas.numpy()[0]), places=6)
+
+    contacts = pipeline.contacts()
+    pipeline.collide(model.state(), contacts)
+    count = int(contacts.soft_contact_count.numpy()[0])
+    indices = contacts.soft_contact_indices.numpy()[:count]
+    test.assertGreater(count, 0)
+    test.assertTrue(np.all(indices[:, 0] >= 0) & np.all(indices[:, 1] >= 0) & np.all(indices[:, 2] >= 0))
+    test.assertTrue(np.all(contacts.soft_contact_particle.numpy()[:count] < 0))
+    test.assertTrue(np.all(contacts.soft_contact_patch_area.numpy()[:count] > 0.0))
+    test.assertTrue(np.all(contacts.soft_contact_area_weight.numpy()[:count] > 0.0))
+
+
+def test_surface_replacement_rejects_unsupported_selected_shape(test, device):
+    """A selected mesh without the real face SDF is rejected, never downgraded to particles."""
+    model = _build_replacement_triangle_model(device, mesh_shape=True)
+    selector = _replacement_selector(model)
+    with test.assertRaises(ValueError):
+        newton.CollisionPipeline(
+            model,
+            broad_phase="nxn",
+            enable_rigid_soft_full_surface_contact=True,
+            rigid_soft_surface_replacement=selector,
+        )
+
+
+def test_surface_replacement_clips_current_world_area_and_centroid(test, device):
+    """The strict half-space clip returns full, partial, and empty world patches."""
+    out_area = wp.zeros(1, dtype=float, device=device)
+    out_bary = wp.zeros(1, dtype=wp.vec3, device=device)
+    p0, p1, p2 = wp.vec3(0.0, 0.0, 0.0), wp.vec3(1.0, 0.0, 0.0), wp.vec3(0.0, 1.0, 0.0)
+    b0, b1, b2 = wp.vec3(1.0, 0.0, 0.0), wp.vec3(0.0, 1.0, 0.0), wp.vec3(0.0, 0.0, 1.0)
+
+    def run(psi):
+        wp.launch(
+            _clip_triangle_kernel,
+            dim=1,
+            inputs=[p0, p1, p2, b0, b1, b2, *psi],
+            outputs=[out_area, out_bary],
+            device=device,
+        )
+        return float(out_area.numpy()[0]), out_bary.numpy()[0].copy()
+
+    area, bary = run((-1.0, -1.0, -1.0))
+    test.assertAlmostEqual(area, 0.5, places=6)
+    np.testing.assert_allclose(bary, [1.0 / 3.0] * 3, atol=1e-6)
+    area, bary = run((-1.0, 1.0, 1.0))
+    test.assertAlmostEqual(area, 0.125, places=6)
+    np.testing.assert_allclose(bary, [2.0 / 3.0, 1.0 / 6.0, 1.0 / 6.0], atol=1e-6)
+    area, _bary = run((1.0, 1.0, 1.0))
+    test.assertEqual(area, 0.0)
+
+
+def test_surface_replacement_none_preserves_legacy_metadata(test, device):
+    """The None mode keeps particle output and initializes new metadata to (0, 1)."""
+    model = _build_replacement_triangle_model(device)
+    pipeline = newton.CollisionPipeline(model, broad_phase="nxn", soft_contact_margin=0.1)
+    contacts = pipeline.contacts()
+    pipeline.collide(model.state(), contacts)
+    count = int(contacts.soft_contact_count.numpy()[0])
+    test.assertGreater(count, 0)
+    test.assertTrue(np.all(contacts.soft_contact_indices.numpy()[:count, 1] < 0))
+    np.testing.assert_array_equal(contacts.soft_contact_patch_area.numpy()[:count], 0.0)
+    np.testing.assert_array_equal(contacts.soft_contact_area_weight.numpy()[:count], 1.0)
+
+
 add_function_test(
     TestFullSurfaceSoftContact,
     "test_soft_contact_schema",
     test_soft_contact_schema,
     devices=soft_devices,
 )
+
+for _name, _fn in (
+    ("test_public_surface_replacement_replaces_selected_streams", test_public_surface_replacement_replaces_selected_streams),
+    ("test_surface_replacement_rejects_unsupported_selected_shape", test_surface_replacement_rejects_unsupported_selected_shape),
+    ("test_surface_replacement_clips_current_world_area_and_centroid", test_surface_replacement_clips_current_world_area_and_centroid),
+    ("test_surface_replacement_none_preserves_legacy_metadata", test_surface_replacement_none_preserves_legacy_metadata),
+):
+    add_function_test(TestFullSurfaceSoftContact, _name, _fn, devices=soft_devices)
 
 
 # ---------------------------------------------------------------------------
