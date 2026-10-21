@@ -22,3 +22,9 @@ You can also explore the examples in the ``newton/examples/`` directory for more
 
    /tutorials/00_introduction
    /tutorials/01_robotics
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Simulation Examples
+
+   /tutorials/usb_hub_pickup
