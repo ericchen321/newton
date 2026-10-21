@@ -1611,6 +1611,19 @@ add_contact_example_test(
 )
 
 
+class TestUSBHubPickupExample(NewtonTestCase):
+    pass
+
+
+add_example_test(
+    TestUSBHubPickupExample,
+    name="multiphysics.example_usb_hub_pickup",
+    devices=cuda_test_devices,
+    test_options={"num-frames": 540, "test_timeout": 1200},
+    use_viewer=True,
+)
+
+
 class TestMultiphysicsExamples(NewtonTestCase):
     pass
 
