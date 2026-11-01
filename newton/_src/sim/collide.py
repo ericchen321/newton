@@ -2315,8 +2315,6 @@ class CollisionPipeline:
         self._soft_self_contact_detector: TriMeshCollisionDetector | None = None
         self._self_contact_matcher: SelfContactMatcher | None = None
         self._contact_matching_pos_threshold = contact_matching_pos_threshold
-        # Contact history kept per Contacts buffer catches up on resets through these.
-        self._world_resets = WorldResetEpochs(model.world_count, device=device) if matching_sticky else None
 
         # Publish only after all construction succeeds.
         if publish_capacity:
